@@ -35,3 +35,4 @@ venv.bak/
 *.njsproj
 *.sln
 *.sw?
+.env
