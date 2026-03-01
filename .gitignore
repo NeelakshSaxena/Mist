@@ -1,4 +1,37 @@
-__pycache__/
-outputs/
-.vscode/
+# Environments
+mist_env/
+env/
+venv/
 .env
+
+# Datasets
+dataset/raw/*
+!dataset/raw/.gitkeep
+dataset/resized/*
+!dataset/resized/.gitkeep
+
+# Outputs
+outputs/watermarked/*
+!outputs/watermarked/.gitkeep
+outputs/attacked/*
+!outputs/attacked/.gitkeep
+outputs/logs/*
+!outputs/logs/.gitkeep
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env.bak/
+venv.bak/
+
+# Project configuration
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
