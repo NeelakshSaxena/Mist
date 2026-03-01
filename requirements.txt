@@ -1,14 +1,10 @@
-torch>=1.13.1          # use CUDA-enabled torch if you have GPU
-torchvision
-ftfy
-regex
-tqdm
-Pillow
 numpy
-scipy
-kornia==0.6.8
-lpips                 # perceptual metric
-facenet-pytorch
-git+https://github.com/openai/CLIP.git
-scikit-image
 opencv-python
+scipy
+pillow
+matplotlib
+scikit-image
+tqdm
+reedsolo
+cryptography
+kaggle
