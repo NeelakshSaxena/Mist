@@ -38,12 +38,12 @@ def debug_extraction():
         
         # Extract Unattacked Baseline
         recovered_baseline = extract_watermark_spatial(rgb_to_y(watermarked_bgr), num_bits=64, alpha=alpha)
-        acc_baseline = sum([1 for a, b in zip(payload, recovered_baseline)]) / 64 * 100 if recovered_baseline else 0
+        acc_baseline = sum([1 for a, b in zip(payload, recovered_baseline) if a == b]) / 64 * 100 if recovered_baseline else 0
         
         # Attack JPEG
         attacked_bgr = attack_jpeg(watermarked_bgr, quality=50)
         recovered_jpeg = extract_watermark_spatial(rgb_to_y(attacked_bgr), num_bits=64, alpha=alpha)
-        acc_jpeg = sum([1 for a, b in zip(payload, recovered_jpeg)]) / 64 * 100 if recovered_jpeg else 0
+        acc_jpeg = sum([1 for a, b in zip(payload, recovered_jpeg) if a == b]) / 64 * 100 if recovered_jpeg else 0
         
         print(f"{os.path.basename(img_path)} | Base: {acc_baseline}% | JPEG: {acc_jpeg}%")
 
