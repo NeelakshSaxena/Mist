@@ -33,7 +33,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.core.wm_engine import embed, detect, embed_with_prng_payload
+from src.core.wm_engine import embed, detect, detect_robust, embed_with_prng_payload
 
 # ── Optional metrics imports (graceful fallback) ───────────────────────────
 try:
@@ -202,20 +202,21 @@ def run_validation(image_path: str | None = None) -> None:
 
     # ── 6. Attack robustness ──────────────────────────────────────────────────
     attacks = [
-        ("JPEG Q30",           lambda i: attack_jpeg(i, quality=30)),
-        ("Resize 0.5×→orig",   lambda i: attack_resize(i, scale=0.5)),
-        ("Resize 2.0×→orig",   lambda i: attack_resize(i, scale=2.0)),
-        ("Crop 30%",           lambda i: attack_crop(i, fraction=0.30)),
-        ("Brightness ×1.2",    lambda i: attack_brightness(i, factor=1.2)),
-        ("Brightness ×0.8",    lambda i: attack_brightness(i, factor=0.8)),
-        ("Gaussian blur σ=1.5",lambda i: attack_blur(i, sigma=1.5)),
+        ("JPEG Q30",           lambda i: attack_jpeg(i, quality=30),      False),
+        ("Resize 0.5×→orig",   lambda i: attack_resize(i, scale=0.5),     False),
+        ("Resize 2.0×→orig",   lambda i: attack_resize(i, scale=2.0),     False),
+        ("Crop 30%",           lambda i: attack_crop(i, fraction=0.30),   True),   # uses detect_robust
+        ("Brightness ×1.2",    lambda i: attack_brightness(i, factor=1.2),False),
+        ("Brightness ×0.8",    lambda i: attack_brightness(i, factor=0.8),False),
+        ("Gaussian blur σ=1.5",lambda i: attack_blur(i, sigma=1.5),       False),
     ]
 
     print(f"[6] Detection — Attack Robustness")
     print(SEP)
-    for attack_name, attack_fn in attacks:
+    for attack_name, attack_fn, robust in attacks:
         attacked = attack_fn(watermarked)
-        res = detect(attacked, key)
+        # Crop uses detect_robust (exhaustive grid search) — other attacks use detect()
+        res = detect_robust(attacked, key) if robust else detect(attacked, key)
         c = res["confidence"]
         r = res["raw_score"]
         ok = c >= 0.55
@@ -230,9 +231,10 @@ def run_validation(image_path: str | None = None) -> None:
     fpr_result = detect(img, key)
     fc = fpr_result["confidence"]
     print(f"  confidence on original (no watermark): {fc:.6f}")
-    fpr_ok = abs(fc - 0.5) < 0.1   # should be within ±0.1 of 0.5
-    status = PASS if fpr_ok else WARN
-    print(f"  |confidence − 0.5| = {abs(fc-0.5):.6f}  [expect < 0.10]  {status}")
+    fpr_ok = abs(fc - 0.5) < 0.05   # tightened: single-alignment detect() should give near-0.5
+    status = PASS if fpr_ok else FAIL
+    all_pass &= fpr_ok
+    print(f"  |confidence − 0.5| = {abs(fc-0.5):.6f}  [expect < 0.05]  {status}")
     print()
 
     # ── 8. Wrong key sanity ───────────────────────────────────────────────────

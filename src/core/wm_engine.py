@@ -68,6 +68,7 @@ import struct
 
 import cv2
 import numpy as np
+from scipy.fft import dctn, idctn
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tunable constants
@@ -258,23 +259,29 @@ def _pad_to_8(arr: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _apply_block_dct(y_float: np.ndarray) -> np.ndarray:
-    """Apply 8×8 block-wise 2D DCT.  Input must be float32 with dimensions % 8 == 0."""
+    """
+    Apply 8×8 block-wise 2D DCT using scipy — fully vectorised, no Python loop.
+
+    Reshape (H, W) → (bh, 8, bw, 8) → transpose → (bh, bw, 8, 8), apply
+    dctn(norm='ortho') over axes (-2, -1), then reverse the reshape.
+    This is equivalent to calling cv2.dct on every 8×8 block but ~10× faster.
+    """
     h, w = y_float.shape
-    out = np.empty_like(y_float)
-    for i in range(0, h, 8):
-        for j in range(0, w, 8):
-            out[i:i+8, j:j+8] = cv2.dct(y_float[i:i+8, j:j+8])
-    return out
+    bh, bw = h // 8, w // 8
+    blocks = y_float.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)  # (bh, bw, 8, 8)
+    dct_blocks = dctn(blocks, type=2, axes=(-2, -1), norm='ortho')
+    return dct_blocks.transpose(0, 2, 1, 3).reshape(h, w).astype(np.float32)
 
 
 def _apply_block_idct(dct_img: np.ndarray) -> np.ndarray:
-    """Apply 8×8 block-wise 2D IDCT."""
+    """
+    Apply 8×8 block-wise 2D IDCT using scipy — fully vectorised.
+    """
     h, w = dct_img.shape
-    out = np.empty_like(dct_img)
-    for i in range(0, h, 8):
-        for j in range(0, w, 8):
-            out[i:i+8, j:j+8] = cv2.idct(dct_img[i:i+8, j:j+8])
-    return out
+    bh, bw = h // 8, w // 8
+    blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)  # (bh, bw, 8, 8)
+    idct_blocks = idctn(blocks, type=2, axes=(-2, -1), norm='ortho')
+    return idct_blocks.transpose(0, 2, 1, 3).reshape(h, w).astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,33 +324,82 @@ def embed(image: np.ndarray, bitstream: np.ndarray, key: bytes) -> np.ndarray:
     orig_h, orig_w = Y.shape
     Y_padded = _pad_to_8(Y)
     ph, pw = Y_padded.shape
+    bh, bw = ph // 8, pw // 8
 
-    # DCT
-    dct_img = _apply_block_dct(Y_padded)
+    # ── Precompute tile lookup table ──────────────────────────────────────────
+    # For each tile position (tr, tc) in [0, TILE_SIZE)², precompute:
+    #   tile_p1[tr, tc]  = (u1, v1) — first coefficient index
+    #   tile_p2[tr, tc]  = (u2, v2) — second coefficient index
+    #   tile_bits[tr, tc] = 0 or 1  — embedded bit
+    # This replaces 8256 HMAC + RNG calls in the loop.
+    tile_p1   = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
+    tile_p2   = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
+    tile_bits = np.zeros((TILE_SIZE, TILE_SIZE),    dtype=np.int8)
+    for tr in range(TILE_SIZE):
+        for tc in range(TILE_SIZE):
+            seed = _block_seed_2d(key, tr, tc)
+            p1, p2 = _select_pair(seed)
+            tile_p1[tr, tc]   = p1
+            tile_p2[tr, tc]   = p2
+            tile_bits[tr, tc] = _block_bit(key, tr, tc)
 
-    # Embed bit-by-bit, using 2D block position for deterministic seeding.
-    # Using (br, bc) = (i//8, j//8) as the seed coordinates ensures the same
-    # pair/bit assignment at that grid location, regardless of image crop.
-    n_bits = len(bits)
-    bit_idx = 0   # sequential index only for the bitstream tiling
+    # ── Reshape Y into blocks (bh, bw, 8, 8) ─────────────────────────────────
+    Y_blocks = Y_padded.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3).astype(np.float32)
 
-    for i in range(0, ph, 8):
-        for j in range(0, pw, 8):
-            br, bc = i // 8, j // 8
-            # Use position-derived bit (from key + position), ignoring bitstream
-            # tiling — this ensures crop-resilient detection.
-            bit = _block_bit(key, br, bc)
-            seed = _block_seed_2d(key, br, bc)
-            pos1, pos2 = _select_pair(seed)
-            delta = _adaptive_delta(Y_padded[i:i+8, j:j+8])
+    # ── Vectorised variance → delta for every block ───────────────────────────
+    var_blocks   = np.var(Y_blocks, axis=(2, 3))          # (bh, bw)
+    delta_blocks = (BASE_DELTA * (1.0 + BETA * np.sqrt(var_blocks / VAR_NORM))).astype(np.float32)
 
-            dct_img[i:i+8, j:j+8] = _embed_difference(
-                dct_img[i:i+8, j:j+8], bit, pos1, pos2, delta
-            )
-            bit_idx += 1
+    # ── DCT ───────────────────────────────────────────────────────────────────
+    dct_img    = _apply_block_dct(Y_padded)
+    dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)  # (bh, bw, 8, 8)
 
-    # IDCT → spatial
-    Y_watermarked = _apply_block_idct(dct_img)
+    # ── Per-block tile coordinates ────────────────────────────────────────────
+    br_idx = np.arange(bh, dtype=np.int32)[:, None]   # (bh, 1)
+    bc_idx = np.arange(bw, dtype=np.int32)[None, :]   # (1, bw)
+    tr_idx = br_idx % TILE_SIZE                        # (bh, bw) broadcast
+    tc_idx = bc_idx % TILE_SIZE
+
+    # Gather per-block pair and bit from tile table
+    p1u = tile_p1[tr_idx, tc_idx, 0].astype(np.int64)  # (bh, bw)
+    p1v = tile_p1[tr_idx, tc_idx, 1].astype(np.int64)
+    p2u = tile_p2[tr_idx, tc_idx, 0].astype(np.int64)
+    p2v = tile_p2[tr_idx, tc_idx, 1].astype(np.int64)
+    blk_bits = tile_bits[tr_idx, tc_idx].astype(np.int8)  # (bh, bw)
+
+    # ── Gather C1, C2 for every block ─────────────────────────────────────────
+    # dct_blocks[br, bc, u, v] — advanced index with all arrays (bh, bw)
+    br_full = np.broadcast_to(br_idx, (bh, bw))
+    bc_full = np.broadcast_to(bc_idx, (bh, bw))
+    c1 = dct_blocks[br_full, bc_full, p1u, p1v].copy()  # (bh, bw)
+    c2 = dct_blocks[br_full, bc_full, p2u, p2v].copy()
+
+    # ── Vectorised difference modulation ──────────────────────────────────────
+    # bit==1: enforce C1 - C2 >= delta   (boost C1, reduce C2 by half deficit each)
+    # bit==0: enforce C2 - C1 >= delta
+    delta = delta_blocks  # (bh, bw)
+    bit1_mask = blk_bits == 1   # (bh, bw) bool
+    bit0_mask = ~bit1_mask
+
+    # Bit-1 blocks
+    diff1 = c1 - c2                         # (bh, bw)
+    deficit1 = np.maximum(0.0, delta - diff1)
+    c1_new = np.where(bit1_mask, c1 + deficit1 / 2.0, c1)
+    c2_new = np.where(bit1_mask, c2 - deficit1 / 2.0, c2)
+
+    # Bit-0 blocks  (overwrite the bit-1 result for bit-0 positions)
+    diff0 = c2_new - c1_new
+    deficit0 = np.maximum(0.0, delta - diff0)
+    c1_new = np.where(bit0_mask, c1_new - deficit0 / 2.0, c1_new)
+    c2_new = np.where(bit0_mask, c2_new + deficit0 / 2.0, c2_new)
+
+    # ── Scatter back ──────────────────────────────────────────────────────────
+    dct_blocks[br_full, bc_full, p1u, p1v] = c1_new
+    dct_blocks[br_full, bc_full, p2u, p2v] = c2_new
+
+    # ── IDCT → spatial ────────────────────────────────────────────────────────
+    dct_img_out = dct_blocks.transpose(0, 2, 1, 3).reshape(ph, pw).astype(np.float32)
+    Y_watermarked = _apply_block_idct(dct_img_out)
 
     # Crop back to original size, reconstruct BGR
     Y_out = Y_watermarked[:orig_h, :orig_w]
@@ -403,15 +459,10 @@ def detect(image: np.ndarray, key: bytes) -> dict:
 
     _, Y_full = _to_ycbcr(image)
 
-    # ── Precompute the TILE_SIZE×TILE_SIZE reference pattern ──────────────────
-    # For each tiled position (tr, tc), precompute:
-    #   - pos1, pos2: coefficient positions (from _block_seed_2d)
-    #   - expected_sign: +1 or -1 (from _block_bit)
-    # This avoids re-hashing inside any loop.
+    # ── Precompute tile reference pattern (8×8 tile positions) ───────────────
     tile_pos1  = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
     tile_pos2  = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
     tile_signs = np.zeros((TILE_SIZE, TILE_SIZE),    dtype=np.float32)
-
     for tr in range(TILE_SIZE):
         for tc in range(TILE_SIZE):
             seed = _block_seed_2d(key, tr, tc)
@@ -420,93 +471,45 @@ def detect(image: np.ndarray, key: bytes) -> dict:
             tile_pos2[tr, tc] = p2
             tile_signs[tr, tc] = 1.0 if _block_bit(key, tr, tc) == 1 else -1.0
 
-    # ── Two-level grid search ─────────────────────────────────────────────────
-    # Level 1: 8 pixel offsets in y/x (handles sub-block crop margins)
-    # Level 2: TILE_SIZE block offsets in y/x (handles whole-block crop margins)
-    # The block-phase search is vectorised using modular indexing on a
-    # prebuilt per-block raw evidence matrix.
-    best_raw_score: float = -2.0
-    best_confidence: float = 0.0
+    def _score_at_offset(Y: np.ndarray, blk_dy: int = 0, blk_dx: int = 0) -> float:
+        """
+        Compute the raw correlation score for a given block-phase offset.
+        Y must already be padded to a multiple of 8.
+        """
+        ph, pw = Y.shape
+        bh, bw = ph // 8, pw // 8
+        dct_img = _apply_block_dct(Y)
+        dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)  # (bh,bw,8,8)
+        Y_blocks   = Y.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
+        var_blocks = np.var(Y_blocks.astype(np.float32), axis=(2, 3))
+        delta_blocks = (BASE_DELTA * (1.0 + BETA * np.sqrt(var_blocks / VAR_NORM))).astype(np.float32)
 
-    for px_dy in range(8):
-        for px_dx in range(8):
-            Y_shifted = Y_full[px_dy:, px_dx:]
-            if Y_shifted.shape[0] < 8 or Y_shifted.shape[1] < 8:
-                continue
+        br_idx = np.arange(bh, dtype=np.int32)[:, None]
+        bc_idx = np.arange(bw, dtype=np.int32)[None, :]
+        tr_idx = (br_idx + blk_dy) % TILE_SIZE
+        tc_idx = (bc_idx + blk_dx) % TILE_SIZE
 
-            Y_padded = _pad_to_8(Y_shifted)
-            dct_img  = _apply_block_dct(Y_padded)
-            ph, pw   = Y_padded.shape
-            bh, bw   = ph // 8, pw // 8
+        # Vectorise over the 64 tile positions: build ev_mats[tr, tc, bh, bw]
+        ev_mats = np.empty((TILE_SIZE, TILE_SIZE, bh, bw), dtype=np.float32)
+        for tr in range(TILE_SIZE):
+            for tc in range(TILE_SIZE):
+                p1 = tuple(tile_pos1[tr, tc])
+                p2 = tuple(tile_pos2[tr, tc])
+                obs = dct_blocks[:, :, p1[0], p1[1]] - dct_blocks[:, :, p2[0], p2[1]]
+                ev_mats[tr, tc] = np.tanh(obs / (delta_blocks + 1e-6))
 
-            # Reshape for vectorised block access: (bh, bw, 8, 8)
-            # dct_blocks[br, bc] = 8×8 DCT block at grid position (br, bc)
-            dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
-            # spatial blocks for variance
-            Y_blocks = Y_padded.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
+        ev_gathered   = ev_mats[tr_idx, tc_idx, br_idx, bc_idx]
+        sign_gathered = tile_signs[tr_idx, tc_idx]
+        return float(np.mean(ev_gathered * sign_gathered))
 
-            # For each block, compute raw observed_diff / delta for all tile positions:
-            # We'll compute evidence for all (tr, tc) simultaneously.
-            # ev_matrix[br, bc] = tanh(obs_diff / delta) for the pair at
-            #   tile pos (br%T, bc%T), combined with the expected_sign below.
-            # Since different tile positions have different pairs, we loop over
-            # the 64 unique (tr,tc) combos — the inner work is numpy array ops.
-
-            # Build per-tile-position evidence matrices (TILE_SIZE×TILE_SIZE
-            # of matrices, each of shape bh×bw)
-            # ev_by_tile[tr, tc, br, bc] = tanh(diff/delta) for block (br,bc)
-            # evaluated as if it belongs to tile position (tr, tc).
-            # Indexed as: for blocks where (br%T)==tr and (bc%T)==tc, this is
-            # the actual evidence; elsewhere it's garbage but we mask it out.
-
-            # Fast approach: compute ev_raw_matrix[br, bc] using the tile
-            # position (br%T, bc%T) for each block — this is what the embedder
-            # actually used, and is what the naive (no-crop) detector uses.
-            # Then for each block-phase shift (blk_dy, blk_dx), the tile
-            # position becomes ((br+blk_dy)%T, (bc+blk_dx)%T), which means
-            # we use a different pair for each block.
-            # This requires 64 separate pair lookups.  We do this efficiently
-            # by prebuilding ev_matrices for each of the 64 tile positions,
-            # then assembling per-phase scores using numpy indexing.
-
-            # ev_mats[tr][tc] has shape (bh, bw), containing the evidence for
-            # each block if it were assigned tile position (tr, tc).
-            ev_mats = np.zeros((TILE_SIZE, TILE_SIZE, bh, bw), dtype=np.float32)
-            var_blocks = np.var(Y_blocks.astype(np.float32), axis=(2, 3))  # (bh, bw)
-            delta_blocks = (BASE_DELTA * (1.0 + BETA * np.sqrt(var_blocks / VAR_NORM))).astype(np.float32)
-
-            for tr in range(TILE_SIZE):
-                for tc in range(TILE_SIZE):
-                    p1 = tuple(tile_pos1[tr, tc])
-                    p2 = tuple(tile_pos2[tr, tc])
-                    obs = dct_blocks[:, :, p1[0], p1[1]] - dct_blocks[:, :, p2[0], p2[1]]
-                    ev_mats[tr, tc] = np.tanh(obs / (delta_blocks + 1e-6))
-
-            # For each (blk_dy, blk_dx) phase, compute mean evidence:
-            #   mean over all (br, bc) of: ev_mats[(br+blk_dy)%T, (bc+blk_dx)%T, br, bc]
-            #                              × tile_signs[(br+blk_dy)%T, (bc+blk_dx)%T]
-            # Vectorised: construct tr_idx[br, bc] and tc_idx[br, bc] arrays,
-            # gather from ev_mats and tile_signs, multiply, mean.
-            br_idx = np.arange(bh, dtype=np.int32)[:, None]  # (bh, 1)
-            bc_idx = np.arange(bw, dtype=np.int32)[None, :]  # (1, bw)
-
-            for blk_dy in range(TILE_SIZE):
-                tr_idx = (br_idx + blk_dy) % TILE_SIZE   # (bh, bw)
-                for blk_dx in range(TILE_SIZE):
-                    tc_idx_arr = (bc_idx + blk_dx) % TILE_SIZE   # (bh, bw) broadcast
-
-                    # Gather evidence and signs
-                    ev_gathered   = ev_mats[tr_idx, tc_idx_arr, br_idx, bc_idx]
-                    sign_gathered = tile_signs[tr_idx, tc_idx_arr]
-
-                    raw_score_candidate = float(np.mean(ev_gathered * sign_gathered))
-                    if raw_score_candidate > best_raw_score:
-                        best_raw_score = raw_score_candidate
-                        best_confidence = _sigmoid(raw_score_candidate)
-
-    raw_score = best_raw_score
-    confidence = best_confidence
-    detected = confidence >= DETECTION_THRESHOLD
+    # ── Standard detection: alignment (0,0) only ──────────────────────────────
+    # FPR rationale: an unwatermarked image has zero-mean random DCT differences.
+    # Testing a single alignment gives E[score]=0 with small variance → low FPR.
+    # The exhaustive grid search (detect_robust) is reserved for known-cropped images.
+    Y_padded = _pad_to_8(Y_full)
+    raw_score = _score_at_offset(Y_padded, 0, 0)
+    confidence = _sigmoid(raw_score)
+    detected   = confidence >= DETECTION_THRESHOLD
 
     return {
         "detected":   detected,
@@ -514,6 +517,82 @@ def detect(image: np.ndarray, key: bytes) -> dict:
         "raw_score":  round(raw_score, 6),
     }
 
+
+def detect_robust(image: np.ndarray, key: bytes) -> dict:
+    """
+    Crop-resilient watermark detector.
+
+    Identical to detect() but performs an exhaustive two-level grid search:
+    - Level 1: 8 pixel-level offsets in y and x (handles sub-block crop margins)
+    - Level 2: TILE_SIZE block-phase offsets in y and x (handles full-block shifts)
+
+    Use this when the image is known to have been cropped.  Do NOT use as the
+    default detector: taking the maximum over 4096 trials inflates the FPR on
+    unwatermarked images.
+
+    Parameters / Returns: same as detect().
+    """
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("detect_robust() expects a 3-channel BGR image (H, W, 3).")
+
+    _, Y_full = _to_ycbcr(image)
+
+    # Precompute tile reference pattern
+    tile_pos1  = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
+    tile_pos2  = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
+    tile_signs = np.zeros((TILE_SIZE, TILE_SIZE),    dtype=np.float32)
+    for tr in range(TILE_SIZE):
+        for tc in range(TILE_SIZE):
+            seed = _block_seed_2d(key, tr, tc)
+            p1, p2 = _select_pair(seed)
+            tile_pos1[tr, tc] = p1
+            tile_pos2[tr, tc] = p2
+            tile_signs[tr, tc] = 1.0 if _block_bit(key, tr, tc) == 1 else -1.0
+
+    best_raw_score: float = -2.0
+
+    for px_dy in range(8):
+        for px_dx in range(8):
+            Y_shifted = Y_full[px_dy:, px_dx:]
+            if Y_shifted.shape[0] < 8 or Y_shifted.shape[1] < 8:
+                continue
+            Y_padded = _pad_to_8(Y_shifted)
+            ph, pw   = Y_padded.shape
+            bh, bw   = ph // 8, pw // 8
+            dct_img  = _apply_block_dct(Y_padded)
+            dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
+            Y_blocks   = Y_padded.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
+            var_blocks   = np.var(Y_blocks.astype(np.float32), axis=(2, 3))
+            delta_blocks = (BASE_DELTA * (1.0 + BETA * np.sqrt(var_blocks / VAR_NORM))).astype(np.float32)
+
+            # Build ev_mats[tr, tc, bh, bw]
+            ev_mats = np.empty((TILE_SIZE, TILE_SIZE, bh, bw), dtype=np.float32)
+            for tr in range(TILE_SIZE):
+                for tc in range(TILE_SIZE):
+                    p1  = tuple(tile_pos1[tr, tc])
+                    p2  = tuple(tile_pos2[tr, tc])
+                    obs = dct_blocks[:, :, p1[0], p1[1]] - dct_blocks[:, :, p2[0], p2[1]]
+                    ev_mats[tr, tc] = np.tanh(obs / (delta_blocks + 1e-6))
+
+            br_idx = np.arange(bh, dtype=np.int32)[:, None]
+            bc_idx = np.arange(bw, dtype=np.int32)[None, :]
+
+            for blk_dy in range(TILE_SIZE):
+                tr_idx = (br_idx + blk_dy) % TILE_SIZE
+                for blk_dx in range(TILE_SIZE):
+                    tc_idx_arr = (bc_idx + blk_dx) % TILE_SIZE
+                    ev_gathered   = ev_mats[tr_idx, tc_idx_arr, br_idx, bc_idx]
+                    sign_gathered = tile_signs[tr_idx, tc_idx_arr]
+                    score = float(np.mean(ev_gathered * sign_gathered))
+                    if score > best_raw_score:
+                        best_raw_score = score
+
+    confidence = _sigmoid(best_raw_score)
+    return {
+        "detected":   confidence >= DETECTION_THRESHOLD,
+        "confidence": round(confidence, 6),
+        "raw_score":  round(best_raw_score, 6),
+    }
 
 
 def embed_with_prng_payload(image: np.ndarray, key: bytes) -> np.ndarray:
