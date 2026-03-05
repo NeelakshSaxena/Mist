@@ -327,21 +327,34 @@ def embed(image: np.ndarray, bitstream: np.ndarray, key: bytes) -> np.ndarray:
     bh, bw = ph // 8, pw // 8
 
     # ── Precompute tile lookup table ──────────────────────────────────────────
-    # For each tile position (tr, tc) in [0, TILE_SIZE)², precompute:
-    #   tile_p1[tr, tc]  = (u1, v1) — first coefficient index
-    #   tile_p2[tr, tc]  = (u2, v2) — second coefficient index
-    #   tile_bits[tr, tc] = 0 or 1  — embedded bit
-    # This replaces 8256 HMAC + RNG calls in the loop.
-    tile_p1   = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
-    tile_p2   = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
-    tile_bits = np.zeros((TILE_SIZE, TILE_SIZE),    dtype=np.int8)
+    # Coefficient *pair* selection derives from the key (HMAC) — this is the
+    # cryptographic part and stays PRNG-keyed regardless of payload content.
+    # The *bit* to embed now comes from the caller's bitstream, tiled over
+    # all blocks.  This is the Phase 2 change — embed() now actually uses
+    # its bitstream argument instead of ignoring it.
+    tile_p1 = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
+    tile_p2 = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
     for tr in range(TILE_SIZE):
         for tc in range(TILE_SIZE):
             seed = _block_seed_2d(key, tr, tc)
             p1, p2 = _select_pair(seed)
-            tile_p1[tr, tc]   = p1
-            tile_p2[tr, tc]   = p2
-            tile_bits[tr, tc] = _block_bit(key, tr, tc)
+            tile_p1[tr, tc] = p1
+            tile_p2[tr, tc] = p2
+
+    # ── Per-block tile coordinates  ───────────────────────────────────────────
+    br_idx = np.arange(bh, dtype=np.int32)[:, None]   # (bh, 1)
+    bc_idx = np.arange(bw, dtype=np.int32)[None, :]   # (1, bw)
+    tr_idx = br_idx % TILE_SIZE
+    tc_idx = bc_idx % TILE_SIZE
+
+    # Sequential block index (row-major) → index into caller's bitstream
+    blk_seq  = br_idx * bw + bc_idx                    # (bh, bw)
+    blk_bits = bits[blk_seq % len(bits)].astype(np.int8)  # (bh, bw)
+
+    p1u = tile_p1[tr_idx, tc_idx, 0].astype(np.int64)  # (bh, bw)
+    p1v = tile_p1[tr_idx, tc_idx, 1].astype(np.int64)
+    p2u = tile_p2[tr_idx, tc_idx, 0].astype(np.int64)
+    p2v = tile_p2[tr_idx, tc_idx, 1].astype(np.int64)
 
     # ── Reshape Y into blocks (bh, bw, 8, 8) ─────────────────────────────────
     Y_blocks = Y_padded.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3).astype(np.float32)
@@ -353,19 +366,6 @@ def embed(image: np.ndarray, bitstream: np.ndarray, key: bytes) -> np.ndarray:
     # ── DCT ───────────────────────────────────────────────────────────────────
     dct_img    = _apply_block_dct(Y_padded)
     dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)  # (bh, bw, 8, 8)
-
-    # ── Per-block tile coordinates ────────────────────────────────────────────
-    br_idx = np.arange(bh, dtype=np.int32)[:, None]   # (bh, 1)
-    bc_idx = np.arange(bw, dtype=np.int32)[None, :]   # (1, bw)
-    tr_idx = br_idx % TILE_SIZE                        # (bh, bw) broadcast
-    tc_idx = bc_idx % TILE_SIZE
-
-    # Gather per-block pair and bit from tile table
-    p1u = tile_p1[tr_idx, tc_idx, 0].astype(np.int64)  # (bh, bw)
-    p1v = tile_p1[tr_idx, tc_idx, 1].astype(np.int64)
-    p2u = tile_p2[tr_idx, tc_idx, 0].astype(np.int64)
-    p2v = tile_p2[tr_idx, tc_idx, 1].astype(np.int64)
-    blk_bits = tile_bits[tr_idx, tc_idx].astype(np.int8)  # (bh, bw)
 
     # ── Gather C1, C2 for every block ─────────────────────────────────────────
     # dct_blocks[br, bc, u, v] — advanced index with all arrays (bh, bw)
@@ -473,15 +473,22 @@ def detect(image: np.ndarray, key: bytes) -> dict:
 
     def _score_at_offset(Y: np.ndarray, blk_dy: int = 0, blk_dx: int = 0) -> float:
         """
-        Compute the raw correlation score for a given block-phase offset.
-        Y must already be padded to a multiple of 8.
+        Signed-correlation watermark score.
+
+        For the Phase 1 PRNG-seeded bitstream:
+          raw_score = mean( tanh((C1-C2)/delta) * expected_sign )
+        Positive score → watermark present. Near-zero → absent or wrong key.
+
+        Note: this score assumes the embedded bits match the PRNG-expected
+        signs used in Phase 1.  Phase 2 detection is handled by mist.verify()
+        which uses ECC+signature as its detection proof, not this score.
         """
         ph, pw = Y.shape
         bh, bw = ph // 8, pw // 8
-        dct_img = _apply_block_dct(Y)
-        dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)  # (bh,bw,8,8)
+        dct_img    = _apply_block_dct(Y)
+        dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
         Y_blocks   = Y.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
-        var_blocks = np.var(Y_blocks.astype(np.float32), axis=(2, 3))
+        var_blocks   = np.var(Y_blocks.astype(np.float32), axis=(2, 3))
         delta_blocks = (BASE_DELTA * (1.0 + BETA * np.sqrt(var_blocks / VAR_NORM))).astype(np.float32)
 
         br_idx = np.arange(bh, dtype=np.int32)[:, None]
@@ -489,24 +496,20 @@ def detect(image: np.ndarray, key: bytes) -> dict:
         tr_idx = (br_idx + blk_dy) % TILE_SIZE
         tc_idx = (bc_idx + blk_dx) % TILE_SIZE
 
-        # Vectorise over the 64 tile positions: build ev_mats[tr, tc, bh, bw]
-        ev_mats = np.empty((TILE_SIZE, TILE_SIZE, bh, bw), dtype=np.float32)
-        for tr in range(TILE_SIZE):
-            for tc in range(TILE_SIZE):
-                p1 = tuple(tile_pos1[tr, tc])
-                p2 = tuple(tile_pos2[tr, tc])
-                obs = dct_blocks[:, :, p1[0], p1[1]] - dct_blocks[:, :, p2[0], p2[1]]
-                ev_mats[tr, tc] = np.tanh(obs / (delta_blocks + 1e-6))
+        p1u = tile_pos1[tr_idx, tc_idx, 0].astype(np.int64)
+        p1v = tile_pos1[tr_idx, tc_idx, 1].astype(np.int64)
+        p2u = tile_pos2[tr_idx, tc_idx, 0].astype(np.int64)
+        p2v = tile_pos2[tr_idx, tc_idx, 1].astype(np.int64)
 
-        ev_gathered   = ev_mats[tr_idx, tc_idx, br_idx, bc_idx]
+        br_full = np.broadcast_to(br_idx, (bh, bw))
+        bc_full = np.broadcast_to(bc_idx, (bh, bw))
+        obs = (dct_blocks[br_full, bc_full, p1u, p1v]
+             - dct_blocks[br_full, bc_full, p2u, p2v])
+        ev            = np.tanh(obs / (delta_blocks + 1e-6))
         sign_gathered = tile_signs[tr_idx, tc_idx]
-        return float(np.mean(ev_gathered * sign_gathered))
+        return float(np.mean(ev * sign_gathered))
 
-    # ── Standard detection: alignment (0,0) only ──────────────────────────────
-    # FPR rationale: an unwatermarked image has zero-mean random DCT differences.
-    # Testing a single alignment gives E[score]=0 with small variance → low FPR.
-    # The exhaustive grid search (detect_robust) is reserved for known-cropped images.
-    Y_padded = _pad_to_8(Y_full)
+    Y_padded  = _pad_to_8(Y_full)
     raw_score = _score_at_offset(Y_padded, 0, 0)
     confidence = _sigmoid(raw_score)
     detected   = confidence >= DETECTION_THRESHOLD
@@ -556,23 +559,14 @@ def detect_robust(image: np.ndarray, key: bytes) -> dict:
             Y_shifted = Y_full[px_dy:, px_dx:]
             if Y_shifted.shape[0] < 8 or Y_shifted.shape[1] < 8:
                 continue
-            Y_padded = _pad_to_8(Y_shifted)
-            ph, pw   = Y_padded.shape
-            bh, bw   = ph // 8, pw // 8
-            dct_img  = _apply_block_dct(Y_padded)
+            Y_padded   = _pad_to_8(Y_shifted)
+            ph, pw     = Y_padded.shape
+            bh, bw     = ph // 8, pw // 8
+            dct_img    = _apply_block_dct(Y_padded)
             dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
             Y_blocks   = Y_padded.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)
             var_blocks   = np.var(Y_blocks.astype(np.float32), axis=(2, 3))
             delta_blocks = (BASE_DELTA * (1.0 + BETA * np.sqrt(var_blocks / VAR_NORM))).astype(np.float32)
-
-            # Build ev_mats[tr, tc, bh, bw]
-            ev_mats = np.empty((TILE_SIZE, TILE_SIZE, bh, bw), dtype=np.float32)
-            for tr in range(TILE_SIZE):
-                for tc in range(TILE_SIZE):
-                    p1  = tuple(tile_pos1[tr, tc])
-                    p2  = tuple(tile_pos2[tr, tc])
-                    obs = dct_blocks[:, :, p1[0], p1[1]] - dct_blocks[:, :, p2[0], p2[1]]
-                    ev_mats[tr, tc] = np.tanh(obs / (delta_blocks + 1e-6))
 
             br_idx = np.arange(bh, dtype=np.int32)[:, None]
             bc_idx = np.arange(bw, dtype=np.int32)[None, :]
@@ -580,10 +574,17 @@ def detect_robust(image: np.ndarray, key: bytes) -> dict:
             for blk_dy in range(TILE_SIZE):
                 tr_idx = (br_idx + blk_dy) % TILE_SIZE
                 for blk_dx in range(TILE_SIZE):
-                    tc_idx_arr = (bc_idx + blk_dx) % TILE_SIZE
-                    ev_gathered   = ev_mats[tr_idx, tc_idx_arr, br_idx, bc_idx]
-                    sign_gathered = tile_signs[tr_idx, tc_idx_arr]
-                    score = float(np.mean(ev_gathered * sign_gathered))
+                    tc_idx = (bc_idx + blk_dx) % TILE_SIZE
+                    p1u = tile_pos1[tr_idx, tc_idx, 0].astype(np.int64)
+                    p1v = tile_pos1[tr_idx, tc_idx, 1].astype(np.int64)
+                    p2u = tile_pos2[tr_idx, tc_idx, 0].astype(np.int64)
+                    p2v = tile_pos2[tr_idx, tc_idx, 1].astype(np.int64)
+                    br_full = np.broadcast_to(br_idx, (bh, bw))
+                    bc_full = np.broadcast_to(bc_idx, (bh, bw))
+                    obs   = dct_blocks[br_full, bc_full, p1u, p1v] - dct_blocks[br_full, bc_full, p2u, p2v]
+                    ev    = np.tanh(obs / (delta_blocks + 1e-6))
+                    sign_gathered = tile_signs[tr_idx, tc_idx]
+                    score = float(np.mean(ev * sign_gathered))
                     if score > best_raw_score:
                         best_raw_score = score
 
@@ -595,24 +596,104 @@ def detect_robust(image: np.ndarray, key: bytes) -> dict:
     }
 
 
-def embed_with_prng_payload(image: np.ndarray, key: bytes) -> np.ndarray:
+def extract_bits(image: np.ndarray, key: bytes, n_bits: int) -> list[int]:
     """
-    Convenience wrapper for Phase 1: generates the PRNG-derived bitstream from
-    the key and embeds it.  Mirrors the exact bitstream that detect() will
-    regenerate, ensuring the detect/embed pair is self-consistent.
+    Recover embedded bits from an image.
 
-    Note: since embed() now uses position-based bit assignment via _block_bit(),
-    the `bitstream` argument passed to embed() is ignored in favour of per-block
-    key-derived bits.  This wrapper exists for API compatibility.
+    For each block, the PRNG-derived coefficient pair (pos1, pos2) is recomputed
+    from the key, and the hard decision is:
+        bit = 1  if  DCT[pos1] > DCT[pos2]
+        bit = 0  otherwise
+
+    This is the Phase 2 recovery path:
+        extract_bits → ecc.decode_payload → payload.parse_embed_payload → crypto.verify
 
     Parameters
     ----------
-    image : np.ndarray  BGR image, uint8.
-    key   : bytes       Secret embedding key.
+    image  : np.ndarray   BGR image (uint8, H×W×3).
+    key    : bytes        Same secret embed key used during watermarking.
+    n_bits : int          Number of bits to recover (must be ≤ total blocks).
+                         Pass ecc.ECC_TOTAL_BITS (1184) for Phase 2 payloads.
 
     Returns
     -------
-    np.ndarray  Watermarked BGR image.
+    list[int]  Hard-decision bit sequence of length n_bits.
+
+    Raises
+    ------
+    ValueError  If the image is too small to hold n_bits.
     """
-    # The bitstream argument is ignored internally; pass a dummy.
-    return embed(image, np.array([0], dtype=np.int32), key)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("extract_bits() expects a 3-channel BGR image (H, W, 3).")
+
+    _, Y_full = _to_ycbcr(image)
+    Y_padded  = _pad_to_8(Y_full)
+    ph, pw    = Y_padded.shape
+    bh, bw    = ph // 8, pw // 8
+    n_blocks  = bh * bw
+
+    if n_blocks < n_bits:
+        raise ValueError(
+            f"Image has only {n_blocks} blocks but {n_bits} bits were requested. "
+            f"Minimum image size for {n_bits} bits: "
+            f"{int((n_bits ** 0.5) * 8) + 8}×{int((n_bits ** 0.5) * 8) + 8} px."
+        )
+
+    # Precompute PRNG pair table (key → coefficient positions)
+    tile_p1 = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
+    tile_p2 = np.zeros((TILE_SIZE, TILE_SIZE, 2), dtype=np.int8)
+    for tr in range(TILE_SIZE):
+        for tc in range(TILE_SIZE):
+            seed = _block_seed_2d(key, tr, tc)
+            p1, p2 = _select_pair(seed)
+            tile_p1[tr, tc] = p1
+            tile_p2[tr, tc] = p2
+
+    dct_img    = _apply_block_dct(Y_padded)
+    dct_blocks = dct_img.reshape(bh, 8, bw, 8).transpose(0, 2, 1, 3)  # (bh, bw, 8, 8)
+
+    br_idx = np.arange(bh, dtype=np.int32)[:, None]
+    bc_idx = np.arange(bw, dtype=np.int32)[None, :]
+    tr_idx = br_idx % TILE_SIZE
+    tc_idx = bc_idx % TILE_SIZE
+
+    p1u = tile_p1[tr_idx, tc_idx, 0].astype(np.int64)
+    p1v = tile_p1[tr_idx, tc_idx, 1].astype(np.int64)
+    p2u = tile_p2[tr_idx, tc_idx, 0].astype(np.int64)
+    p2v = tile_p2[tr_idx, tc_idx, 1].astype(np.int64)
+
+    br_full = np.broadcast_to(br_idx, (bh, bw))
+    bc_full = np.broadcast_to(bc_idx, (bh, bw))
+
+    c1 = dct_blocks[br_full, bc_full, p1u, p1v]  # (bh, bw)
+    c2 = dct_blocks[br_full, bc_full, p2u, p2v]
+
+    # Hard decision: C1 > C2 → embedded bit was 1
+    bits_2d = (c1 > c2).astype(np.int8)          # (bh, bw)
+    bits_flat = bits_2d.ravel()                    # row-major order matches embed()
+
+    return bits_flat[:n_bits].tolist()
+
+
+def embed_with_prng_payload(image: np.ndarray, key: bytes) -> np.ndarray:
+    """
+    Phase 1 compatibility wrapper: embeds the HMAC-PRNG-derived bit pattern.
+
+    For each block (br, bc) in the image, the embedded bit is
+    _block_bit(key, br % TILE_SIZE, bc % TILE_SIZE) — exactly the sign
+    pattern that detect() tests against (tile_signs).
+
+    For production use (Phase 2), call mist.watermark() instead.
+    """
+    _, Y = _to_ycbcr(image)
+    Y_pad = _pad_to_8(Y)
+    ph, pw = Y_pad.shape
+    bh, bw = ph // 8, pw // 8
+
+    # Build bitstream in row-major block order matching embed()'s indexing:
+    # block (br, bc) -> sequential index br*bw + bc -> bit derived from (br%T, bc%T)
+    bits = np.empty(bh * bw, dtype=np.int32)
+    for br in range(bh):
+        for bc in range(bw):
+            bits[br * bw + bc] = _block_bit(key, br % TILE_SIZE, bc % TILE_SIZE)
+    return embed(image, bits, key)
