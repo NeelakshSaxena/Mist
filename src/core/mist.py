@@ -1,5 +1,5 @@
 """
-src/core/mist.py  –  Mist High-Level API  (Phase 2 + Phase 3)
+src/core/mist.py  –  Mist High-Level API  (Phase 2 + Phase 3 + Phase 4)
 
 Public surface
 --------------
@@ -40,6 +40,7 @@ import numpy as np
 
 from src.core.wm_engine    import embed, detect, extract_bits
 from src.core.wm_engine_p3 import embed_p3, detect_p3, extract_bits_p3
+from src.core.wm_engine_p4 import embed_p4, detect_p4
 from src.core.payload      import build_embed_payload, parse_embed_payload, unpack
 from src.core.ecc          import encode_payload, decode_payload, ECC_TOTAL_BITS
 from src.core.crypto       import verify as crypto_verify
@@ -217,4 +218,118 @@ def verify_p3(
     result["detected"] = True
     result["verified"] = True
     result["payload"]  = unpack(payload_core)
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+#  Phase 4 — Spatial-Redundant Embed + Verify
+# ─────────────────────────────────────────────────────────
+
+def watermark_p4(
+    image:         np.ndarray,
+    user_id:       int,
+    image_id:      int,
+    private_key:   bytes,
+    embed_key:     bytes,
+    timestamp:     int | None = None,
+    model_version: int = 1,
+) -> np.ndarray:
+    """
+    Phase 4 spatial-redundant watermark embed.
+
+    Distributes the ECC-encoded payload across macro-tiles with an outer
+    Reed-Solomon code.  The watermark survives 50%+ area destruction on
+    512×512 images and 80%+ on 1024×1024 images.
+
+    Parameters identical to watermark().  Uses Phase 4 tile-based engine.
+    """
+    _, _, full_bits = build_embed_payload(
+        private_key, user_id, image_id, timestamp, model_version
+    )
+    encoded_bits = encode_payload(full_bits)
+    bitstream = np.array(encoded_bits, dtype=np.int32)
+    return embed_p4(image, bitstream, embed_key)
+
+
+def verify_p4(
+    image:      np.ndarray,
+    public_key: bytes,
+    embed_key:  bytes,
+) -> dict:
+    """
+    Phase 4 detect + reconstruct + cryptographic verify.
+
+    Works on arbitrary image fragments — does NOT require the full image.
+
+    Returns dict with keys:
+        detected              : bool
+        verified              : bool
+        ecc_success           : bool
+        payload               : dict | None
+        error                 : str | None
+        confidence            : float
+        presence_score        : float
+        tiles_located         : int
+        shards_recovered      : int
+        shards_needed         : int
+        reconstruction_ratio  : float
+        scale_scores          : dict
+        harmonic_score        : float
+    """
+    result = {
+        "detected": False, "verified": False, "ecc_success": False,
+        "payload": None, "error": None,
+        "confidence": 0.0, "presence_score": 0.0,
+        "tiles_located": 0, "shards_recovered": 0,
+        "shards_needed": 0, "reconstruction_ratio": 0.0,
+        "scale_scores": {}, "harmonic_score": 0.0,
+    }
+
+    # Phase 4 detection (includes Phase 3 presence + shard extraction + outer RS)
+    det = detect_p4(image, embed_key)
+    result["detected"]             = det["detected"]
+    result["confidence"]           = det["confidence"]
+    result["presence_score"]       = det["presence_score"]
+    result["scale_scores"]         = det["scale_scores"]
+    result["harmonic_score"]       = det["harmonic_score"]
+    result["tiles_located"]        = det["tiles_located"]
+    result["shards_recovered"]     = det["shards_recovered"]
+    result["shards_needed"]        = det["shards_needed"]
+    result["reconstruction_ratio"] = det["reconstruction_ratio"]
+
+    if det.get("error"):
+        result["error"] = det["error"]
+
+    inner = det.get("inner_codeword")
+    if inner is None:
+        return result
+
+    # Inner RS decode (Phase 2)
+    # Convert bytes to bit list for the inner RS decoder
+    inner_bits = []
+    for byte in inner:
+        for i in range(7, -1, -1):
+            inner_bits.append((byte >> i) & 1)
+    decoded_bits, ecc_ok = decode_payload(inner_bits)
+    result["ecc_success"] = ecc_ok
+
+    if not ecc_ok:
+        result["error"] = "Inner RS decode failed after outer RS reconstruction."
+        return result
+
+    # Parse payload + crypto verify
+    try:
+        payload_core, signature = parse_embed_payload(decoded_bits)
+    except Exception as exc:
+        result["error"] = f"Payload parse failed: {exc}"
+        return result
+
+    sig_ok = crypto_verify(public_key, payload_core, signature)
+    if not sig_ok:
+        result["error"] = "Signature verification failed — payload may be tampered."
+        return result
+
+    result["verified"]   = True
+    result["confidence"] = 1.0
+    result["payload"]    = unpack(payload_core)
     return result
