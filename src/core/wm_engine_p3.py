@@ -224,21 +224,17 @@ def _pad_to_n(arr: np.ndarray, n: int) -> np.ndarray:
 
 
 def _block_dct(y_float: np.ndarray, bs: int) -> np.ndarray:
-    """Vectorised block-DCT for arbitrary block size bs."""
-    h, w = y_float.shape
-    bh, bw = h // bs, w // bs
-    blocks = y_float.reshape(bh, bs, bw, bs).transpose(0, 2, 1, 3)
-    dct_blocks = dctn(blocks, type=2, axes=(-2, -1), norm="ortho")
-    return dct_blocks.transpose(0, 2, 1, 3).reshape(h, w).astype(np.float32)
+    """Vectorised block-DCT for arbitrary block size bs.
+    Uses GPU acceleration when available."""
+    from src.core.gpu_accel import gpu_block_dct
+    return gpu_block_dct(y_float, bs)
 
 
 def _block_idct(dct_img: np.ndarray, bs: int) -> np.ndarray:
-    """Vectorised block-IDCT for arbitrary block size bs."""
-    h, w = dct_img.shape
-    bh, bw = h // bs, w // bs
-    blocks = dct_img.reshape(bh, bs, bw, bs).transpose(0, 2, 1, 3)
-    idct_blocks = idctn(blocks, type=2, axes=(-2, -1), norm="ortho")
-    return idct_blocks.transpose(0, 2, 1, 3).reshape(h, w).astype(np.float32)
+    """Vectorised block-IDCT for arbitrary block size bs.
+    Uses GPU acceleration when available."""
+    from src.core.gpu_accel import gpu_block_idct
+    return gpu_block_idct(dct_img, bs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

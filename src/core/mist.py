@@ -1,5 +1,5 @@
 """
-src/core/mist.py  –  Mist High-Level API  (Phase 2 + Phase 3 + Phase 4)
+src/core/mist.py  –  Mist High-Level API  (Phase 2 + Phase 3 + Phase 4 + Phase 5)
 
 Public surface
 --------------
@@ -22,6 +22,16 @@ Phase 3 (diffusion-resistant):
         "harmonic_score": float  — FFT harmonic detection score
       }
 
+Phase 5 (geometry-invariant + forensic engine):
+  watermark_p5(image, user_id, image_id, private_key, embed_key, ...)
+    → np.ndarray  (watermarked BGR image, Phase 4 spatial-redundant embedding)
+
+  verify_p5(image, public_key, embed_key)
+    → dict  (Phase 5 geometry-invariant detection + crypto verification)
+
+  forensic_report(image, public_key, embed_key)
+    → ForensicReport  (court-grade statistical analysis)
+
 Design (Phase 3)
 ----------------
 Embedding:
@@ -41,6 +51,8 @@ import numpy as np
 from src.core.wm_engine    import embed, detect, extract_bits
 from src.core.wm_engine_p3 import embed_p3, detect_p3, extract_bits_p3
 from src.core.wm_engine_p4 import embed_p4, detect_p4
+from src.core.wm_engine_p5 import embed_p5, detect_p5
+from src.core.forensic     import forensic_report as _forensic_report, ForensicReport
 from src.core.payload      import build_embed_payload, parse_embed_payload, unpack
 from src.core.ecc          import encode_payload, decode_payload, ECC_TOTAL_BITS
 from src.core.crypto       import verify as crypto_verify
@@ -333,3 +345,145 @@ def verify_p4(
     result["confidence"] = 1.0
     result["payload"]    = unpack(payload_core)
     return result
+
+
+# ─────────────────────────────────────────────────────────
+#  Phase 5 — Geometry-Invariant Embed + Verify + Forensic
+# ─────────────────────────────────────────────────────────
+
+def watermark_p5(
+    image:         np.ndarray,
+    user_id:       int,
+    image_id:      int,
+    private_key:   bytes,
+    embed_key:     bytes,
+    timestamp:     int | None = None,
+    model_version: int = 1,
+) -> np.ndarray:
+    """
+    Phase 5 geometry-invariant watermark embed.
+
+    Embedding is identical to Phase 4 (spatial-redundant tiles).
+    Phase 5 extends *detection* to survive rotation, scaling, and cropping.
+
+    Parameters identical to watermark().  Uses Phase 4 tile-based engine.
+    """
+    _, _, full_bits = build_embed_payload(
+        private_key, user_id, image_id, timestamp, model_version
+    )
+    encoded_bits = encode_payload(full_bits)
+    bitstream = np.array(encoded_bits, dtype=np.int32)
+    return embed_p5(image, bitstream, embed_key)
+
+
+def verify_p5(
+    image:      np.ndarray,
+    public_key: bytes,
+    embed_key:  bytes,
+) -> dict:
+    """
+    Phase 5 geometry-invariant detect + cryptographic verify.
+
+    Handles rotated, scaled, and cropped images by searching for the
+    best geometric alignment before running Phase 4 shard extraction.
+
+    Returns dict with all keys from verify_p4() plus:
+        geometry              : dict — {angle_deg, scale_factor, score, method}
+        corrected_image_shape : tuple | None
+    """
+    result = {
+        "detected": False, "verified": False, "ecc_success": False,
+        "payload": None, "error": None,
+        "confidence": 0.0, "presence_score": 0.0,
+        "tiles_located": 0, "shards_recovered": 0,
+        "shards_needed": 0, "reconstruction_ratio": 0.0,
+        "scale_scores": {}, "harmonic_score": 0.0,
+        "geometry": None, "corrected_image_shape": None,
+    }
+
+    # Phase 5 detection (includes Phase 4 + geometric search)
+    det = detect_p5(image, embed_key)
+    result["detected"]             = det["detected"]
+    result["confidence"]           = det["confidence"]
+    result["presence_score"]       = det["presence_score"]
+    result["scale_scores"]         = det["scale_scores"]
+    result["harmonic_score"]       = det["harmonic_score"]
+    result["tiles_located"]        = det["tiles_located"]
+    result["shards_recovered"]     = det["shards_recovered"]
+    result["shards_needed"]        = det["shards_needed"]
+    result["reconstruction_ratio"] = det["reconstruction_ratio"]
+    result["geometry"]             = det.get("geometry")
+    result["corrected_image_shape"]= det.get("corrected_image_shape")
+
+    if det.get("error"):
+        result["error"] = det["error"]
+
+    inner = det.get("inner_codeword")
+    if inner is None:
+        return result
+
+    # Inner RS decode (Phase 2)
+    inner_bits = []
+    for byte in inner:
+        for i in range(7, -1, -1):
+            inner_bits.append((byte >> i) & 1)
+    decoded_bits, ecc_ok = decode_payload(inner_bits)
+    result["ecc_success"] = ecc_ok
+
+    if not ecc_ok:
+        result["error"] = "Inner RS decode failed after geometric correction."
+        return result
+
+    # Parse payload + crypto verify
+    try:
+        payload_core, signature = parse_embed_payload(decoded_bits)
+    except Exception as exc:
+        result["error"] = f"Payload parse failed: {exc}"
+        return result
+
+    sig_ok = crypto_verify(public_key, payload_core, signature)
+    if not sig_ok:
+        result["error"] = "Signature verification failed — payload may be tampered."
+        return result
+
+    result["verified"]   = True
+    result["confidence"] = 1.0
+    result["payload"]    = unpack(payload_core)
+    return result
+
+
+def forensic_report(
+    image:      np.ndarray,
+    public_key: bytes,
+    embed_key:  bytes,
+) -> ForensicReport:
+    """
+    Generate a comprehensive forensic watermark analysis report.
+
+    This is the Phase 5 deliverable: a court-grade statistical analysis
+    that provides confidence scoring, tampering likelihood, geometric
+    transform estimation, and payload recovery.
+
+    Parameters
+    ----------
+    image      : np.ndarray  BGR uint8 (H, W, 3)
+    public_key : bytes       32-byte Ed25519 public key
+    embed_key  : bytes       Secret embedding key
+
+    Returns
+    -------
+    ForensicReport  Complete forensic analysis with:
+        .watermark_detected      : bool
+        .payload_recovered       : bool
+        .payload_verified        : bool
+        .confidence_pct          : float  (calibrated %)
+        .correlation_strength    : float
+        .p_value                 : float
+        .tampering_likelihood    : str
+        .estimated_rotation_deg  : float
+        .estimated_scale_factor  : float
+        .payload                 : dict | None
+        .summary()               : str  (human-readable report)
+        .to_json()               : str  (serialised)
+    """
+    return _forensic_report(image, public_key, embed_key)

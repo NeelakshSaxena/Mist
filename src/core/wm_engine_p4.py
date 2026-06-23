@@ -767,32 +767,36 @@ def detect_p4(image_fragment: np.ndarray, key: bytes) -> dict:
         result["confidence"] = 0.15 * result["presence_score"]
         return result
 
-    if shard_result["shards_valid"] < K_SHARDS:
-        result["error"] = (
-            f"Insufficient shards: {shard_result['shards_valid']}/{K_SHARDS}. "
-            f"Need {K_SHARDS - shard_result['shards_valid']} more."
-        )
-        # Partial confidence
-        ratio = shard_result["shards_valid"] / K_SHARDS
-        result["confidence"] = (
-            0.15 * result["presence_score"] +
-            0.30 * min(1.0, ratio)
-        )
-        return result
-
     # ── Outer RS decode ───────────────────────────────────────────────
+    # Attempt RS decode even when shards < K_SHARDS — RS erasure correction
+    # can handle up to (n_rs - K_SHARDS) erasures, which may succeed if the
+    # codeword length is large enough relative to the gap.
     shard_map = shard_result["shard_map"]
     crc_ok_set = shard_result["shard_crc_ok"]
     max_idx = max(shard_map.keys()) if shard_map else 0
     inner = None
 
+    # Compute expected n_rs from image dimensions (more accurate than max_idx)
+    h, w = image_fragment.shape[:2]
+    expected_tiles = (h // MT_SIZE) * (w // MT_SIZE)
+    expected_n_rs = min(expected_tiles, 255)
+
     candidates = sorted(set([
         max(max_idx + 1, K_SHARDS + 1),
+        expected_n_rs,
         64, 128, 255,
         shard_result["n_rs"],
     ]))
     for n_rs in candidates:
         if n_rs < max_idx + 1 or n_rs < K_SHARDS + 1 or n_rs > 255:
+            continue
+        # Check if RS can handle the number of missing/corrupt shards
+        n_missing = n_rs - shard_result["shards_valid"]
+        n_non_crc = shard_result["shards_valid"] - len(crc_ok_set)
+        n_parity = n_rs - K_SHARDS
+        # RS can correct: erasures ≤ n_parity, or erasures + 2*errors ≤ n_parity
+        # Quick skip if clearly impossible
+        if n_missing > n_parity:
             continue
         # Smart decode: CRC-ok shards are reliable data;
         # non-CRC shards are treated as erasures (2× correction capacity)
@@ -801,8 +805,19 @@ def detect_p4(image_fragment: np.ndarray, key: bytes) -> dict:
             break
 
     if inner is None:
-        result["error"] = "Outer RS decode failed — too many corrupted shards."
-        result["confidence"] = 0.35
+        if shard_result["shards_valid"] < K_SHARDS:
+            result["error"] = (
+                f"Insufficient shards: {shard_result['shards_valid']}/{K_SHARDS}. "
+                f"Need {K_SHARDS - shard_result['shards_valid']} more."
+            )
+            ratio = shard_result["shards_valid"] / K_SHARDS
+            result["confidence"] = (
+                0.15 * result["presence_score"] +
+                0.30 * min(1.0, ratio)
+            )
+        else:
+            result["error"] = "Outer RS decode failed — too many corrupted shards."
+            result["confidence"] = 0.35
         return result
 
     result["inner_codeword"] = inner
