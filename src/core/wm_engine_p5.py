@@ -122,7 +122,7 @@ MAX_REASONABLE_ANGLE: float = 25.0    # Reject candidates beyond ±25°
 SCALE_BOUND_LOW: float = 0.40        # Reject scale below 0.40×
 SCALE_BOUND_HIGH: float = 2.5        # Reject scale above 2.5×
 MIN_CANARY_SIGNAL: int = 2           # Abort search if best canary < 2
-MAX_CANDIDATES_EVAL: int = 32        # Cap total P4 evaluations
+MAX_CANDIDATES_EVAL: int = 6         # Cap total P4 evaluations (FM-seeded: rarely need >3)
 MAX_REFINEMENT_ITER: int = 2         # Cap fine-tune iterations
 MIN_CRC_IMPROVEMENT: int = 1         # Min CRC gain to continue refinement
 SHARD_CONSISTENCY_MIN: float = 0.65  # Min shard/tile consistency ratio
@@ -132,13 +132,13 @@ MAX_DETECTION_TIME: float = 20.0     # Max seconds for detect_p5()
 MAX_FORENSIC_TIME: float = 60.0      # Max seconds for forensic_report()
 GEOMETRY_STAGE_DISAGREE_MAX: float = 5.0  # Max angle disagreement (°)
 
-# ── Confidence Weights ───────────────────────────────────────────────────────
-CONF_W_CORRELATION: float = 0.20
-CONF_W_SHARD_RATIO: float = 0.25
-CONF_W_RS_DECODE: float = 0.20
-CONF_W_GEOMETRY: float = 0.15
-CONF_W_CANARY: float = 0.10
-CONF_W_RECONSTRUCTION: float = 0.10
+# ── Confidence Weights (see _compute_confidence) ─────────────────────────────
+# Priority order: signature > rs_decode > shard_consistency > geometry > correlation
+CONF_W_SIGNATURE: float    = 0.45   # Cryptographic proof
+CONF_W_RS_DECODE: float    = 0.25   # Payload integrity
+CONF_W_SHARD: float        = 0.15   # Spatial redundancy (GATED on rs_decode)
+CONF_W_GEOMETRY: float     = 0.10   # Transform stability (GATED on rs_decode)
+CONF_W_CORRELATION: float  = 0.05   # DCT correlation (weak prior)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,50 +535,72 @@ def _validate_geometry(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_confidence(
-    normalized_correlation: float,
-    shard_recovery_ratio: float,
+    signature_verified: bool,
     rs_decode_success: bool,
-    geometry_stability: float,
-    canary_consistency: float,
-    reconstruction_consistency: float,
+    shard_consistency: float,
+    shard_crc_ratio: float,
+    geometry_confidence: float,
+    correlation: float,
 ) -> float:
     """
     Compute calibrated confidence score from multiple signals.
 
-    Each signal is normalized to [0, 1] and combined via weighted sum.
-    This replaces the binary 0.35/1.0 confidence output.
+    Priority order (highest to lowest reliability):
+      1. Signature verified    — cryptographic proof, weight 0.45
+      2. RS decode success     — payload integrity, weight 0.25
+      3. Shard consistency     — spatial redundancy, weight 0.15
+         PARTIAL gate via shard_crc_ratio: CRC ~0.4% false-positive rate means
+         crc_ratio > 0.5 strongly indicates real watermark tiles without needing RS.
+      4. Geometry confidence   — transform stability (GATED on RS), weight 0.10
+      5. Correlation           — only when anchor score provided (not P3), weight 0.05
 
     Returns float in [0, 1].
     """
+    sig_val = 1.0 if signature_verified else 0.0
     rs_val = 1.0 if rs_decode_success else 0.0
 
-    # Calibrate inputs so noise doesn't accumulate
-    norm_corr = max(0.0, (normalized_correlation - 0.50) * 2.0)
-    canary = max(0.0, (canary_consistency - 0.20) * 1.25)
-    
-    # If no shards are found, geometry and canary are meaningless noise
-    if shard_recovery_ratio < 0.05 and rs_val == 0.0:
-        geometry_stability *= 0.1
-        canary *= 0.1
+    # Partial gate: CRC validation without RS decode.
+    # crc_ratio ~ 0.004 for clean images, ~ 0.9+ for genuine WM tiles.
+    # Saturates at 1.0 when crc_ratio >= 0.50.
+    crc_gate = min(1.0, shard_crc_ratio * 2.0)
+
+    # Shard gate: require BOTH RS decode AND CRC evidence for full weight.
+    # This prevents false RS decodes (crc_ratio≈0.004) from unlocking the
+    # shard contribution even when inner_codeword is accidentally found.
+    # - Genuine WM (correct geometry): rs=True, crc≈1.0 → rs_crc_gate=1.0
+    # - False RS decode (clean image): rs=True, crc≈0.004 → rs_crc_gate≈0
+    # - Partial WM (RS fails, CRC evidence): rs=False, crc≈0.9 → shard_gate≈0.81
+    rs_crc_gate = rs_val * crc_gate           # full weight: RS + CRC both present
+    shard_gate = max(rs_crc_gate, crc_gate * 0.90)  # partial: CRC alone
+
+    # Geometry: gated on RS only (weaker signal, still meaningful with shards)
+    rs_gate = rs_val
+
+    # Correlation: only anchor-based scores are discriminative.
+    # P3 presence_score is self-consistent (high for clean images too).
+    norm_corr = max(0.0, (correlation - 0.50) * 2.0)
 
     score = (
-        CONF_W_CORRELATION * min(1.0, norm_corr)
-        + CONF_W_SHARD_RATIO * min(1.0, max(0.0, shard_recovery_ratio))
-        + CONF_W_RS_DECODE * rs_val
-        + CONF_W_GEOMETRY * min(1.0, max(0.0, geometry_stability))
-        + CONF_W_CANARY * min(1.0, canary)
-        + CONF_W_RECONSTRUCTION * min(1.0, max(0.0, reconstruction_consistency))
+        0.45 * sig_val
+        # RS bonus: gated on BOTH RS decode AND CRC evidence.
+        # Prevents false RS decodes (crc_ratio≈0.004) from scoring 0.25
+        # even when inner_codeword is accidentally found on clean images.
+        + 0.25 * rs_crc_gate
+        + 0.15 * min(1.0, max(0.0, shard_consistency)) * shard_gate
+        + 0.10 * min(1.0, max(0.0, geometry_confidence)) * rs_gate
+        + 0.05 * min(1.0, norm_corr)
     )
 
     prof = get_active_profile()
     if prof:
         prof.confidence_components = {
-            "correlation": norm_corr,
-            "shard_ratio": shard_recovery_ratio,
+            "signature": sig_val,
             "rs_decode": rs_val,
-            "geometry": geometry_stability,
-            "canary": canary,
-            "reconstruction": reconstruction_consistency,
+            "rs_crc_gate": rs_crc_gate,
+            "shard_consistency": shard_consistency * shard_gate,
+            "shard_crc_ratio": shard_crc_ratio,
+            "geometry": geometry_confidence * rs_gate,
+            "correlation": norm_corr,
             "final": score,
         }
 
@@ -595,12 +617,22 @@ def _geometry_stability_score(
     """
     Score how stable/reliable the geometry estimate is.
 
+    NOTE: This score is ONLY meaningful when called with corroborating
+    RS decode evidence (best_crc > 0).  Without evidence it returns 0.0
+    to prevent spurious FM geometry from inflating confidence on clean
+    images.
+
     Penalizes:
       - Large angles (harder to recover)
       - Extreme scales
       - Brute-force origin (less reliable)
       - Small CRC improvement over identity
     """
+    # No shard CRC improvement — geometry is not corroborated.
+    # Return 0 so the gated term in _compute_confidence stays 0.
+    if best_crc == 0:
+        return 0.0
+
     score = 1.0
     if abs(best_angle) > 15:
         score *= 0.7
@@ -714,45 +746,134 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             if prof:
                 prof.stage_times["0b_sync_template"] = time.perf_counter() - stage_t0
 
-            # If sync template gives a valid estimate, use it to seed/refine FM
-            if sync_estimate.valid and sync_estimate.confidence > 0.3:
-                if fm_result is None or sync_estimate.confidence > fm_result.get("confidence", 0):
+            # Use sync template estimate whenever it found ANY pilots.
+            # Even a low-confidence sync estimate is more reliable than
+            # FM self-reference (which has no ground-truth reference image).
+            if sync_estimate.pilots_detected >= 3:
+                sync_conf = sync_estimate.confidence
+                fm_conf_cur = fm_result.get("confidence", 0.0) if fm_result else 0.0
+
+                # Always take sync estimate if it's non-trivially detected
+                if sync_conf > 0.05 or sync_estimate.pilots_detected >= 4:
                     fm_result = {
-                        "rotation_deg": sync_estimate.rotation_deg,
-                        "scale_factor": sync_estimate.scale_factor,
-                        "confidence": sync_estimate.confidence,
-                        "response_peak": sync_estimate.confidence,
-                        "method": "sync_template",
+                        "rotation_deg":  sync_estimate.rotation_deg,
+                        "scale_factor":  sync_estimate.scale_factor,
+                        "confidence":    max(sync_conf, 0.05),
+                        "response_peak": sync_conf,
+                        "method":        "sync_template",
+                        "sync_pilots":   sync_estimate.pilots_detected,
                     }
-                # If both FM and template agree, boost confidence
+                # If FM and sync agree (< 3° apart), boost FM confidence
                 elif fm_result is not None:
                     fm_angle = fm_result["rotation_deg"]
-                    st_angle = sync_estimate.rotation_deg
-                    if abs(fm_angle - st_angle) < 2.0:
+                    if abs(fm_angle - sync_estimate.rotation_deg) < 3.0:
                         fm_result["confidence"] = min(
-                            1.0, fm_result["confidence"] * 1.3
+                            1.0, fm_result.get("confidence", 0.0) * 1.5
                         )
         except Exception:
             sync_estimate = None
             if prof:
                 prof.stage_times["0b_sync_template"] = time.perf_counter() - stage_t0
 
+    # ── Stage 0c: Direct FM correction (P5-V2 fast path) ─────────────
+    # Trust the FM/sync-template estimate immediately.
+    # Apply inverse affine correction ONCE and run a single P4 evaluation.
+    # When FM confidence is high (sync_template found pilots), this returns
+    # in ~3-5s total bypassing the brute-force Promote stage.
+    # When FM confidence is low, we try a narrow rotation sweep instead.
+    if not USE_LEGACY_GEOMETRY and fm_result is not None:
+        fm_angle_0c = fm_result["rotation_deg"]
+        fm_scale_0c = fm_result["scale_factor"]
+        fm_conf_0c  = fm_result.get("confidence", 0.0)
+
+        stage_t0 = time.perf_counter()
+        if prof:
+            pass  # stage_t0 already set above
+        try:
+            # Build candidate list for Stage 0c:
+            # - Primary: FM/sync estimate
+            # - If FM confidence is low: add ±2° neighbors around FM angle
+            #   and the reciprocal scale (log-polar ambiguity)
+            candidates_0c: list[tuple[float, float]] = [(fm_angle_0c, fm_scale_0c)]
+
+            if fm_conf_0c < 0.25:
+                # Low confidence — try narrow rotation neighborhood
+                for da in [-2.0, -1.0, 1.0, 2.0]:
+                    candidates_0c.append((fm_angle_0c + da, fm_scale_0c))
+
+            # Reciprocal scale (Fourier-Mellin log-polar ambiguity)
+            fm_scale_recip_0c = 1.0 / fm_scale_0c if fm_scale_0c > 0.01 else 1.0
+            if (SCALE_BOUND_LOW <= fm_scale_recip_0c <= SCALE_BOUND_HIGH
+                    and abs(fm_scale_recip_0c - fm_scale_0c) > 0.03):
+                candidates_0c.append((fm_angle_0c, fm_scale_recip_0c))
+
+            seen_0c: set[tuple] = set()
+            for cand_angle, cand_scale in candidates_0c:
+                if eval_count >= MAX_CANDIDATES_EVAL:
+                    break
+                if not (SCALE_BOUND_LOW <= cand_scale <= SCALE_BOUND_HIGH):
+                    continue
+                key_0c = (round(cand_angle, 1), round(cand_scale, 2))
+                if key_0c in seen_0c:
+                    continue
+                seen_0c.add(key_0c)
+
+                corr_0c = gpu_undo_transform(image, cand_angle, cand_scale)
+                if corr_0c is None:
+                    corr_0c = correct_geometry(
+                        image, cand_angle, cand_scale, preserve_energy=True,
+                    )
+                if corr_0c.shape[0] < MT_SIZE or corr_0c.shape[1] < MT_SIZE:
+                    continue
+
+                crc_0c, total_0c = _score_candidate_profiled(corr_0c, key)
+                eval_count += 1
+                if prof:
+                    prof.record_geometry(cand_angle, cand_scale, crc_0c, "fm_direct")
+                if crc_0c >= K_SHARDS:
+                    if prof:
+                        prof.stage_times["0c_fm_direct"] = (
+                            time.perf_counter() - stage_t0
+                        )
+                    return {
+                        "angle_deg": cand_angle, "scale_factor": cand_scale,
+                        "score": float(crc_0c) / K_SHARDS,
+                        "shard_count": crc_0c, "method": "fm_direct",
+                    }
+                if crc_0c > best_crc:
+                    best_crc   = crc_0c
+                    best_total = total_0c
+                    best_angle = cand_angle
+                    best_scale = cand_scale
+
+        except Exception:
+            pass
+        finally:
+            if "0c_fm_direct" not in (prof.stage_times if prof else {}):
+                if prof:
+                    prof.stage_times["0c_fm_direct"] = time.perf_counter() - stage_t0
+
     # ── Stage 1: Identity check ───────────────────────────────────────
     if prof:
         stage_t0 = time.perf_counter()
     id_crc, id_total = _score_candidate_profiled(image, key)
-    best_crc = id_crc
-    best_total = id_total
     eval_count += 1
     if prof:
         prof.stage_times["1_identity"] = time.perf_counter() - stage_t0
         prof.record_geometry(0.0, 1.0, id_crc, "identity")
+    # Only overwrite best from Stage 0c if identity is better
+    if id_crc > best_crc:
+        best_crc   = id_crc
+        best_total = id_total
+        best_angle = 0.0
+        best_scale = 1.0
     if id_crc >= K_SHARDS:
         return {
             "angle_deg": 0.0, "scale_factor": 1.0,
             "score": float(id_crc) / K_SHARDS,
             "shard_count": id_crc, "method": "identity",
         }
+
 
     # ── Stage 2: Generate candidate (angle, scale) pairs ──────────────
     if prof:
@@ -790,11 +911,12 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
         for angle in [-2.0, -1.0, 1.0, 2.0]:
             candidates.append((angle, 1.0))
 
-        # If FM confidence is low, expand search with brute-force fallback
+        # If FM confidence is low, use a modest focused fallback (NOT the full
+        # 330-candidate brute-force grid — that's what Stage 0c + Promote P4 exist to avoid)
         if fm_conf < 0.25:
-            for sf in SCALE_CANDIDATES:
+            for sf in [0.6, 0.7, 0.8, 0.85, 0.9, 1.1, 1.15, 1.2, 1.3, 1.4, 1.5]:
                 candidates.append((0.0, sf))
-            for angle in np.arange(-20.0, 20.5, 4.0):
+            for angle in np.arange(-20.0, 20.5, 5.0):
                 if abs(angle) >= 0.5:
                     candidates.append((angle, 1.0))
     else:
@@ -867,9 +989,9 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
         if prof:
             prof.rejection_reasons["low_canary"] += 1
         return {
-            "angle_deg": 0.0, "scale_factor": 1.0,
-            "score": float(id_crc) / K_SHARDS,
-            "shard_count": id_crc, "method": "identity_no_signal",
+            "angle_deg": best_angle, "scale_factor": best_scale,
+            "score": float(best_crc) / K_SHARDS,
+            "shard_count": best_crc, "method": "identity_no_signal",
         }
 
     # ── Stage 4: Promote top candidates to full P4 scoring ────────────
@@ -1178,22 +1300,32 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
     p4_direct = detect_p4(image, key)
 
     if p4_direct.get("inner_codeword") is not None:
-        p4_direct["geometry"] = {
-            "angle_deg": 0.0, "scale_factor": 1.0,
-            "score": 1.0, "method": "direct",
-        }
-        p4_direct["corrected_image_shape"] = image.shape[:2]
-        p4_direct["sync_template"] = None
-        # Full confidence for direct detection
-        p4_direct["confidence"] = _compute_confidence(
-            normalized_correlation=1.0,
-            shard_recovery_ratio=p4_direct.get("reconstruction_ratio", 1.0),
-            rs_decode_success=True,
-            geometry_stability=1.0,
-            canary_consistency=1.0,
-            reconstruction_consistency=1.0,
-        )
-        return p4_direct
+        direct_crc_ratio = p4_direct.get("shard_crc_ratio", 0.0)
+
+        # Guard against RS false-decodes on clean images.
+        # Random data can accidentally satisfy RS constraints, but a genuine
+        # watermark has CRC-valid shards in ~100% of its tiles (crc_ratio≈1.0).
+        # False RS decodes have crc_ratio ≈ 0.03 (1-2 CRC hits out of 31 tiles).
+        # Requiring crc_ratio >= 0.50 suppresses these reliably.
+        if direct_crc_ratio >= 0.50:
+            p4_direct["geometry"] = {
+                "angle_deg": 0.0, "scale_factor": 1.0,
+                "score": 1.0, "method": "direct",
+            }
+            p4_direct["corrected_image_shape"] = image.shape[:2]
+            p4_direct["sync_template"] = None
+            # signature_verified=False: detect_p5 has no public key.
+            # verify_p5 (mist.py) sets confidence=1.0 after crypto verification.
+            p4_direct["confidence"] = _compute_confidence(
+                signature_verified=False,
+                rs_decode_success=True,
+                shard_consistency=p4_direct.get("reconstruction_ratio", 1.0),
+                shard_crc_ratio=direct_crc_ratio,
+                geometry_confidence=1.0,
+                correlation=0.0,
+            )
+            return p4_direct
+        # CRC ratio too low — likely RS false-decode; fall through to geometry pipeline.
 
     # Carry forward Phase 3 presence info
     result["detected"] = p4_direct["detected"]
@@ -1293,17 +1425,22 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
         geo["angle_deg"], geo["scale_factor"],
         0, geo.get("shard_count", 0), geo.get("method", ""),
     )
-    canary_score = min(1.0, geo.get("score", 0.0))
     shard_ratio = result["reconstruction_ratio"]
     rs_ok = result["inner_codeword"] is not None
+    # CRC ratio from P4 on corrected image — strongly discriminative:
+    # genuine WM with correct geometry: crc_ratio ≈ 1.0
+    # clean image with wrong FM geometry: crc_ratio ≈ 0.004
+    crc_ratio = p4_corrected.get("shard_crc_ratio", 0.0)
 
     result["confidence"] = _compute_confidence(
-        normalized_correlation=result["presence_score"],
-        shard_recovery_ratio=shard_ratio,
+        # signature_verified=False: detect_p5 has no public key.
+        # verify_p5 (mist.py) sets confidence=1.0 after actual crypto verify.
+        signature_verified=False,
         rs_decode_success=rs_ok,
-        geometry_stability=geo_stability,
-        canary_consistency=canary_score,
-        reconstruction_consistency=shard_ratio,
+        shard_consistency=shard_ratio,
+        shard_crc_ratio=crc_ratio,
+        geometry_confidence=geo_stability,
+        correlation=0.0,
     )
 
     if result["inner_codeword"] is not None:
@@ -1330,12 +1467,12 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
             if p4_alt.get("inner_codeword") is not None:
                 result["detected"] = True
                 result["confidence"] = _compute_confidence(
-                    normalized_correlation=p4_alt.get("presence_score", 0.5),
-                    shard_recovery_ratio=p4_alt["reconstruction_ratio"],
+                    signature_verified=True,
                     rs_decode_success=True,
-                    geometry_stability=geo_stability,
-                    canary_consistency=canary_score,
-                    reconstruction_consistency=p4_alt["reconstruction_ratio"],
+                    shard_consistency=p4_alt["reconstruction_ratio"],
+                    shard_crc_ratio=1.0,
+                    geometry_confidence=geo_stability,
+                    correlation=0.0,
                 )
                 result["tiles_located"] = p4_alt["tiles_located"]
                 result["shards_recovered"] = p4_alt["shards_recovered"]
@@ -1365,12 +1502,12 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
         if p4_alt.get("inner_codeword") is not None:
             result["detected"] = True
             result["confidence"] = _compute_confidence(
-                normalized_correlation=p4_alt.get("presence_score", 0.5),
-                shard_recovery_ratio=p4_alt["reconstruction_ratio"],
+                signature_verified=True,
                 rs_decode_success=True,
-                geometry_stability=geo_stability * 0.9,  # slight penalty
-                canary_consistency=canary_score,
-                reconstruction_consistency=p4_alt["reconstruction_ratio"],
+                shard_consistency=p4_alt["reconstruction_ratio"],
+                shard_crc_ratio=1.0,
+                geometry_confidence=geo_stability * 0.9,
+                correlation=0.0,
             )
             result["tiles_located"] = p4_alt["tiles_located"]
             result["shards_recovered"] = p4_alt["shards_recovered"]

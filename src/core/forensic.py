@@ -443,25 +443,16 @@ def forensic_report(
     report.p_value = _estimate_p_value(report.correlation_strength, n_blocks_8)
 
     # Multi-signal confidence (new) — integrates geometry + shard info
-    geo_stability = 1.0
-    canary_score = 0.0
+    # Default geo_stability to 0.0, NOT 1.0: if no geometry was found or
+    # shard_count==0, the FM geometry estimate is uncorroborated noise.
+    # _geometry_stability_score() enforces this via its best_crc==0 guard.
+    geo_stability = 0.0
     if geo:
         geo_stability = _geometry_stability_score(
             geo.get("angle_deg", 0.0), geo.get("scale_factor", 1.0),
             0, geo.get("shard_count", 0), geo.get("method", ""),
         )
-        canary_score = min(1.0, geo.get("score", 0.0))
     shard_ratio = report.reconstruction_ratio
-    multi_conf = _compute_confidence(
-        normalized_correlation=report.correlation_strength,
-        shard_recovery_ratio=shard_ratio,
-        rs_decode_success=False,  # updated below if payload recovered
-        geometry_stability=geo_stability,
-        canary_consistency=canary_score,
-        reconstruction_consistency=shard_ratio,
-    )
-    # Use the higher of legacy vs multi-signal for the final report
-    report.confidence_pct = max(report.confidence_pct, multi_conf * 100.0)
 
     # ── Payload extraction + crypto verification ──────────────────────
     inner = det5.get("inner_codeword")
@@ -490,6 +481,19 @@ def forensic_report(
                     report.payload_verified = False
             except Exception:
                 report.ecc_success = False
+
+    multi_conf = _compute_confidence(
+        signature_verified=report.payload_verified,
+        rs_decode_success=report.ecc_success,
+        shard_consistency=shard_ratio,
+        # For forensic: CRC ratio proxied from ECC success.
+        # Anchor-based correlation_strength IS discriminative (not P3 self-consistent).
+        shard_crc_ratio=1.0 if report.ecc_success else 0.0,
+        geometry_confidence=geo_stability,
+        correlation=report.correlation_strength,
+    )
+    # Use the higher of legacy vs multi-signal for the final report
+    report.confidence_pct = max(report.confidence_pct, multi_conf * 100.0)
 
     # ── Tampering analysis ────────────────────────────────────────────
     shard_result = None

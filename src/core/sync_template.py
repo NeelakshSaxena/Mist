@@ -65,8 +65,8 @@ PILOT_FREQ_HIGH: float = 0.35   # 35% of Nyquist
 DEFAULT_STRENGTH: float = 3.5
 
 # Detection thresholds
-PEAK_SNR_THRESHOLD: float = 4.0     # min SNR for a valid pilot detection
-MIN_PILOTS_DETECTED: int = 8        # minimum pilots for valid sync
+PEAK_SNR_THRESHOLD: float = 3.0     # min SNR for a valid pilot detection (was 4.0)
+MIN_PILOTS_DETECTED: int = 6        # minimum pilots for valid sync (was 8)
 FALSE_PEAK_MAX_RATE: float = 0.05   # max false positive rate
 
 # Matched filter correlation window (pixels in frequency domain)
@@ -440,8 +440,8 @@ def detect_sync_template(
     # ── Rotation search ───────────────────────────────────────────────
     # Rotate expected pilot positions and check match
     cy, cx = ah // 2, aw // 2
-    candidate_angles = np.arange(-15.0, 15.5, 0.5)
-    candidate_scales = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5]
+    candidate_angles = np.arange(-20.0, 20.5, 0.5)  # covers full ±20° spec
+    candidate_scales = [0.55, 0.65, 0.75, 0.85, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
 
     for angle_deg in candidate_angles:
         for scale in candidate_scales:

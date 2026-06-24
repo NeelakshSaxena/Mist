@@ -764,7 +764,9 @@ def detect_p4(image_fragment: np.ndarray, key: bytes) -> dict:
 
     if not shard_result["aligned"]:
         result["error"] = "Grid alignment failed; presence-only detection."
-        result["confidence"] = 0.15 * result["presence_score"]
+        result["shard_crc_ok_count"] = 0
+        result["shard_crc_ratio"] = 0.0
+        result["confidence"] = 0.0
         return result
 
     # ── Outer RS decode ───────────────────────────────────────────────
@@ -804,22 +806,40 @@ def detect_p4(image_fragment: np.ndarray, key: bytes) -> dict:
         if inner is not None:
             break
 
+    # ── CRC-gated confidence (calibrated) ────────────────────────────
+    # CRC passes ~0.4% by chance on random data (1 in 256).
+    # On real watermark tiles with correct geometry: ~90-100% CRC valid.
+    # This ratio is strongly discriminative even without RS decode success.
+    crc_ok_count = len(crc_ok_set)
+    tiles_found = max(1, shard_result["tiles_located"])
+    crc_ratio = crc_ok_count / tiles_found
+    result["shard_crc_ok_count"] = crc_ok_count
+    result["shard_crc_ratio"] = crc_ratio
+
+    shard_ratio = shard_result["shards_valid"] / K_SHARDS
+    crc_gate = min(1.0, crc_ratio * 2.0)  # partial evidence gate
+
     if inner is None:
         if shard_result["shards_valid"] < K_SHARDS:
             result["error"] = (
                 f"Insufficient shards: {shard_result['shards_valid']}/{K_SHARDS}. "
                 f"Need {K_SHARDS - shard_result['shards_valid']} more."
             )
-            ratio = shard_result["shards_valid"] / K_SHARDS
-            result["confidence"] = (
-                0.15 * result["presence_score"] +
-                0.30 * min(1.0, ratio)
-            )
         else:
             result["error"] = "Outer RS decode failed — too many corrupted shards."
-            result["confidence"] = 0.35
+        # P3 presence_score is self-consistent (high for all images) — not used.
+        # Only CRC-gated shard contribution discriminates real from clean.
+        result["confidence"] = 0.15 * min(1.0, shard_ratio) * crc_gate
         return result
 
     result["inner_codeword"] = inner
-    result["confidence"] = 0.85  # High confidence, pending crypto verify
+    # RS decode success: give RS bonus only when CRC evidence is also strong.
+    # crc_ratio < 0.50 on an RS-decoded image indicates a false decode
+    # (random data accidentally satisfying RS constraints but not CRC).
+    # Genuine watermarks have crc_ratio ≈ 1.0 after correct geometry.
+    if crc_ratio >= 0.50:
+        result["confidence"] = 0.25 + 0.15 * min(1.0, shard_ratio) * crc_gate
+    else:
+        # Suspicious RS decode — treat as no-RS for confidence purposes
+        result["confidence"] = 0.15 * min(1.0, shard_ratio) * crc_gate
     return result
