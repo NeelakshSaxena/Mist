@@ -119,7 +119,7 @@ def _gpu_affine_transform(
     return cu_affine(
         Y_gpu, matrix, offset,
         output_shape=(out_h, out_w),
-        order=1,  # bilinear
+        order=3,  # bicubic preserves high-frequency watermark energy
         mode='reflect',
     )
 
@@ -391,12 +391,15 @@ def gpu_undo_transform(
         ch_out = cu_affine(
             ch_gpu, matrix, offset,
             output_shape=(out_h, out_w),
-            order=1, mode='reflect',
+            order=3, mode='reflect',
         )
         result_channels.append(cp.asnumpy(ch_out))
 
     result = np.stack(result_channels, axis=-1)
     result = np.clip(result, 0, 255).astype(np.uint8)
+
+    from src.core.geometry_correction import _preserve_luma_energy
+    result = _preserve_luma_energy(image, result)
 
     # Cleanup
     cp.get_default_memory_pool().free_all_blocks()

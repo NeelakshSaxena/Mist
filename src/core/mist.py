@@ -399,6 +399,7 @@ def verify_p5(
         "shards_needed": 0, "reconstruction_ratio": 0.0,
         "scale_scores": {}, "harmonic_score": 0.0,
         "geometry": None, "corrected_image_shape": None,
+        "shard_crc_ratio": 0.0,
     }
 
     # Phase 5 detection (includes Phase 4 + geometric search)
@@ -414,6 +415,7 @@ def verify_p5(
     result["reconstruction_ratio"] = det["reconstruction_ratio"]
     result["geometry"]             = det.get("geometry")
     result["corrected_image_shape"]= det.get("corrected_image_shape")
+    result["shard_crc_ratio"]      = det.get("shard_crc_ratio", 0.0)
 
     if det.get("error"):
         result["error"] = det["error"]

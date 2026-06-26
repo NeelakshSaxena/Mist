@@ -44,6 +44,7 @@ import hmac
 import numpy as np
 import cv2
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,10 +289,20 @@ def _extract_fft_magnitude(Y: np.ndarray) -> np.ndarray:
     # Resize for deterministic performance
     h, w = Y.shape
     if h != _ANALYSIS_SIZE or w != _ANALYSIS_SIZE:
-        Y_resized = cv2.resize(
-            Y.astype(np.float32), (_ANALYSIS_SIZE, _ANALYSIS_SIZE),
-            interpolation=cv2.INTER_LINEAR,
-        )
+        # Center crop or pad to _ANALYSIS_SIZE
+        Y_resized = np.zeros((_ANALYSIS_SIZE, _ANALYSIS_SIZE), dtype=np.float32)
+        cy_src, cx_src = h // 2, w // 2
+        cy_dst, cx_dst = _ANALYSIS_SIZE // 2, _ANALYSIS_SIZE // 2
+        
+        h_copy = min(h, _ANALYSIS_SIZE)
+        w_copy = min(w, _ANALYSIS_SIZE)
+        
+        src_y1 = cy_src - h_copy // 2
+        src_x1 = cx_src - w_copy // 2
+        dst_y1 = cy_dst - h_copy // 2
+        dst_x1 = cx_dst - w_copy // 2
+        
+        Y_resized[dst_y1:dst_y1+h_copy, dst_x1:dst_x1+w_copy] = Y[src_y1:src_y1+h_copy, src_x1:src_x1+w_copy].astype(np.float32)
     else:
         Y_resized = Y.astype(np.float32)
 
@@ -335,6 +346,12 @@ def _detect_pilots(
     bg_inner = window + 2
     bg_outer = window + 8
 
+    # Precompute relative background mask
+    # This prevents evaluating np.ogrid and dist_sq for every pilot
+    y_idx, x_idx = np.ogrid[-bg_outer:bg_outer + 1, -bg_outer:bg_outer + 1]
+    dist_sq = y_idx**2 + x_idx**2
+    bg_mask = (dist_sq >= bg_inner ** 2) & (dist_sq <= bg_outer ** 2)
+
     for fr, fc, _ in pilots:
         # Clamp coordinates to keep annulus in-bounds
         fr = max(bg_outer, min(h - bg_outer - 1, fr))
@@ -348,15 +365,6 @@ def _detect_pilots(
         peak_val = float(np.max(peak_region))
 
         # Background estimate: annular ring around the peak
-        # Exclude the peak window itself for clean background stats
-        y_coords, x_coords = np.ogrid[
-            fr - bg_outer:fr + bg_outer + 1,
-            fc - bg_outer:fc + bg_outer + 1,
-        ]
-        # Distance from center of annulus (fr, fc) — NOT from bg_outer offset
-        dist_sq = (y_coords - fr) ** 2 + (x_coords - fc) ** 2
-        bg_mask = (dist_sq >= bg_inner ** 2) & (dist_sq <= bg_outer ** 2)
-
         bg_region = magnitude[
             fr - bg_outer:fr + bg_outer + 1,
             fc - bg_outer:fc + bg_outer + 1
@@ -385,6 +393,8 @@ def _detect_pilots(
 def detect_sync_template(
     Y: np.ndarray,
     key: bytes,
+    initial_rotation: Optional[float] = None,
+    initial_scale: Optional[float] = None,
 ) -> SyncEstimate:
     """
     Detect synchronization template and estimate RST parameters.
@@ -399,6 +409,8 @@ def detect_sync_template(
     ----------
     Y   : float32 or uint8 luminance [H, W]
     key : embedding secret key
+    initial_rotation: Optional[float], coarse estimate to check
+    initial_scale: Optional[float], coarse estimate to check
 
     Returns
     -------
@@ -440,8 +452,13 @@ def detect_sync_template(
     # ── Rotation search ───────────────────────────────────────────────
     # Rotate expected pilot positions and check match
     cy, cx = ah // 2, aw // 2
-    candidate_angles = np.arange(-20.0, 20.5, 0.5)  # covers full ±20° spec
-    candidate_scales = [0.55, 0.65, 0.75, 0.85, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+    if initial_rotation is not None and initial_scale is not None:
+        candidate_angles = [initial_rotation]
+        candidate_scales = [initial_scale]
+    else:
+        # Sparse search to keep runtime < 0.5s
+        candidate_angles = np.arange(-20.0, 21.0, 5.0)  # 9 angles
+        candidate_scales = [0.6, 0.8, 1.0, 1.2, 1.4]    # 5 scales
 
     for angle_deg in candidate_angles:
         for scale in candidate_scales:
@@ -457,8 +474,9 @@ def detect_sync_template(
                 # Center, rotate, scale, un-center
                 dy = fr - cy
                 dx = fc - cx
-                new_dy = (cos_a * dy - sin_a * dx) * scale
-                new_dx = (sin_a * dy + cos_a * dx) * scale
+                # Expected frequency is inversely proportional to attack scale
+                new_dy = (cos_a * dy - sin_a * dx) / scale
+                new_dx = (sin_a * dy + cos_a * dx) / scale
                 new_fr = int(round(cy + new_dy))
                 new_fc = int(round(cx + new_dx))
 
@@ -582,8 +600,9 @@ def refine_geometry_from_template(
 
             for fr, fc, phase in pilots_identity:
                 dy, dx = fr - cy, fc - cx
-                new_dy = (cos_a * dy - sin_a * dx) * scale
-                new_dx = (sin_a * dy + cos_a * dx) * scale
+                # Expected frequency is inversely proportional to attack scale
+                new_dy = (cos_a * dy - sin_a * dx) / scale
+                new_dx = (sin_a * dy + cos_a * dx) / scale
                 new_fr = int(round(cy + new_dy))
                 new_fc = int(round(cx + new_dx))
                 if 0 <= new_fr < ah and 0 <= new_fc < aw:

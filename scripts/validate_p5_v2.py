@@ -484,12 +484,14 @@ def main():
                 try:
                     ordered[idx] = future.result()
                 except Exception as exc:
-                    # create a dummy failed result
+                    import traceback
                     _, atype, aparam, true_a, true_s = suite[idx]
                     r = CaseResult(attack_type=atype, attack_param=aparam,
                                    true_angle=true_a, true_scale=true_s)
                     r.stage_budget_fail = f"EXCEPTION: {exc}"
                     ordered[idx] = r
+                    print(f"  [ERR ] {atype:<10} {aparam:<20} EXCEPTION: {exc}")
+                    traceback.print_exc()
                 completed += 1
                 if completed % 4 == 0 or completed == len(suite):
                     print(f"    [{completed}/{len(suite)} done]", flush=True)
@@ -502,9 +504,14 @@ def main():
         if seed == 0:
             fp_n = 5 if args.fast else 10
             print(f"\n  False-positive check ({fp_n} clean images)…")
-            fp_results = run_fp_suite(pub_key, embed_key, n=fp_n)
-            for r in fp_results:
-                print_case(r)
+            try:
+                fp_results = run_fp_suite(pub_key, embed_key, n=fp_n)
+                for r in fp_results:
+                    print_case(r)
+            except Exception as exc:
+                import traceback
+                print(f"  [ERR ] FP suite crashed: {exc}")
+                traceback.print_exc()
 
     # ── Aggregate metrics ─────────────────────────────────────────────────
     print("\n" + "=" * 72)

@@ -133,12 +133,21 @@ MAX_FORENSIC_TIME: float = 60.0      # Max seconds for forensic_report()
 GEOMETRY_STAGE_DISAGREE_MAX: float = 5.0  # Max angle disagreement (°)
 
 # ── Confidence Weights (see _compute_confidence) ─────────────────────────────
-# Priority order: signature > rs_decode > shard_consistency > geometry > correlation
+# Two-head scoring: HEAD A (verification) + HEAD B (detection).
+#
+# HEAD A — fires when RS decode succeeds (answered: "is payload valid?")
 CONF_W_SIGNATURE: float    = 0.45   # Cryptographic proof
 CONF_W_RS_DECODE: float    = 0.25   # Payload integrity
 CONF_W_SHARD: float        = 0.15   # Spatial redundancy (GATED on rs_decode)
 CONF_W_GEOMETRY: float     = 0.10   # Transform stability (GATED on rs_decode)
 CONF_W_CORRELATION: float  = 0.05   # DCT correlation (weak prior)
+#
+# HEAD B — fires when RS decode fails (answered: "is a watermark present?")
+# Cap: 0.50  — so unverified detections never appear as confident as verified.
+CONF_W_SHARD_SIGNAL: float = 0.40   # Raw shard count above noise floor  [Strategy 1]
+CONF_W_PILOT_RATE: float   = 0.35   # Sync template pilot recovery rate  [Strategy 2]
+CONF_W_CRC_EVIDENCE: float = 0.15   # CRC ratio (partial geometry evidence)
+CONF_W_GEO_DET: float      = 0.10   # Geometry confidence
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -541,67 +550,109 @@ def _compute_confidence(
     shard_crc_ratio: float,
     geometry_confidence: float,
     correlation: float,
+    # Strategy 1: raw shard count — works even when RS fails
+    shard_count: int = 0,
+    shards_needed: int = 30,
+    # Strategy 2: pilot recovery rate from sync template
+    pilot_recovery_rate: float = 0.0,
 ) -> float:
     """
     Compute calibrated confidence score from multiple signals.
 
-    Priority order (highest to lowest reliability):
-      1. Signature verified    — cryptographic proof, weight 0.45
-      2. RS decode success     — payload integrity, weight 0.25
-      3. Shard consistency     — spatial redundancy, weight 0.15
-         PARTIAL gate via shard_crc_ratio: CRC ~0.4% false-positive rate means
-         crc_ratio > 0.5 strongly indicates real watermark tiles without needing RS.
-      4. Geometry confidence   — transform stability (GATED on RS), weight 0.10
-      5. Correlation           — only when anchor score provided (not P3), weight 0.05
+    Two heads:
+      HEAD A (verification) — fires when RS decode succeeds:
+        1. Signature verified    weight 0.45
+        2. RS decode success     weight 0.25
+        3. Shard consistency     weight 0.15
+        4. Geometry confidence   weight 0.10
+        5. Correlation           weight 0.05
+
+      HEAD B (detection) — fires when RS decode fails:
+        Answers "is a watermark present?" independently of RS/crypto.
+        1. Shard count signal    weight 0.40  (Strategy 1)
+        2. Pilot recovery rate   weight 0.35  (Strategy 2)
+        3. CRC evidence          weight 0.15
+        4. Geometry confidence   weight 0.10
+
+        HEAD B is capped at 0.50 so unverified detections never
+        appear as confident as verified ones.
 
     Returns float in [0, 1].
     """
     sig_val = 1.0 if signature_verified else 0.0
-    rs_val = 1.0 if rs_decode_success else 0.0
+    rs_val  = 1.0 if rs_decode_success   else 0.0
 
+    # ── HEAD A: Verification path ──────────────────────────────────────
     # Partial gate: CRC validation without RS decode.
     # crc_ratio ~ 0.004 for clean images, ~ 0.9+ for genuine WM tiles.
-    # Saturates at 1.0 when crc_ratio >= 0.50.
     crc_gate = min(1.0, shard_crc_ratio * 2.0)
 
     # Shard gate: require BOTH RS decode AND CRC evidence for full weight.
-    # This prevents false RS decodes (crc_ratio≈0.004) from unlocking the
-    # shard contribution even when inner_codeword is accidentally found.
-    # - Genuine WM (correct geometry): rs=True, crc≈1.0 → rs_crc_gate=1.0
-    # - False RS decode (clean image): rs=True, crc≈0.004 → rs_crc_gate≈0
-    # - Partial WM (RS fails, CRC evidence): rs=False, crc≈0.9 → shard_gate≈0.81
-    rs_crc_gate = rs_val * crc_gate           # full weight: RS + CRC both present
-    shard_gate = max(rs_crc_gate, crc_gate * 0.90)  # partial: CRC alone
+    rs_crc_gate = rs_val * crc_gate
+    shard_gate  = max(rs_crc_gate, crc_gate * 0.90)
 
-    # Geometry: gated on RS only (weaker signal, still meaningful with shards)
-    rs_gate = rs_val
-
-    # Correlation: only anchor-based scores are discriminative.
-    # P3 presence_score is self-consistent (high for clean images too).
+    rs_gate  = rs_val
     norm_corr = max(0.0, (correlation - 0.50) * 2.0)
 
-    score = (
+    score_a = (
         0.45 * sig_val
-        # RS bonus: gated on BOTH RS decode AND CRC evidence.
-        # Prevents false RS decodes (crc_ratio≈0.004) from scoring 0.25
-        # even when inner_codeword is accidentally found on clean images.
         + 0.25 * rs_crc_gate
         + 0.15 * min(1.0, max(0.0, shard_consistency)) * shard_gate
         + 0.10 * min(1.0, max(0.0, geometry_confidence)) * rs_gate
         + 0.05 * min(1.0, norm_corr)
     )
 
+    # ── HEAD B: Detection path (when RS decode fails) ──────────────────
+    # Strategy 1 — Shard CRC count discriminant:
+    #   Clean images:    ~0-1 random CRC matches (noise floor)
+    #   WM under attack: 10-64 CRC matches (even when RS fails)
+    #   Noise floor = 2. Signal saturates at shards_needed (30).
+    noise_floor = 2.0
+    signal_range = shards_needed * 1.0
+    shard_signal = max(0.0, (shard_count - noise_floor) / max(signal_range, 1.0))
+    shard_signal = min(1.0, shard_signal)
+
+    # Strategy 2 — Pilot recovery rate:
+    #   Clean images:    ~4-8% false pilot hits
+    #   WM under attack: 25-80% pilot recovery (pilots survive rotation)
+    #   Normalise: subtract false-alarm floor, scale to [0,1]
+    PILOT_FALSE_ALARM_FLOOR = 0.08   # empirical: ~8% false peaks on clean
+    pilot_signal = max(0.0, (pilot_recovery_rate - PILOT_FALSE_ALARM_FLOOR)
+                       / max(1.0 - PILOT_FALSE_ALARM_FLOOR, 0.01))
+    pilot_signal = min(1.0, pilot_signal)
+
+    score_b = min(0.50, (
+        0.40 * shard_signal
+        + 0.35 * pilot_signal
+        + 0.15 * min(1.0, shard_crc_ratio * 2.0)   # partial CRC evidence
+        + 0.10 * min(1.0, max(0.0, geometry_confidence))
+    ))
+
+    # Use HEAD A when RS succeeded (verification path),
+    # HEAD B when RS failed (detection path).
+    # When RS succeeded, HEAD B can still boost if it's higher
+    # (covers partial RS decodes with high pilot evidence).
+    if rs_decode_success:
+        score = max(score_a, score_b)
+    else:
+        score = score_b
+
     prof = get_active_profile()
     if prof:
         prof.confidence_components = {
-            "signature": sig_val,
-            "rs_decode": rs_val,
-            "rs_crc_gate": rs_crc_gate,
+            "signature":       sig_val,
+            "rs_decode":       rs_val,
+            "rs_crc_gate":     rs_crc_gate,
             "shard_consistency": shard_consistency * shard_gate,
-            "shard_crc_ratio": shard_crc_ratio,
-            "geometry": geometry_confidence * rs_gate,
-            "correlation": norm_corr,
-            "final": score,
+            "shard_crc_ratio":   shard_crc_ratio,
+            "geometry":        geometry_confidence * rs_gate,
+            "correlation":     norm_corr,
+            # Strategy 1+2 signals
+            "shard_signal":    shard_signal,
+            "pilot_signal":    pilot_signal,
+            "score_head_a":    score_a,
+            "score_head_b":    score_b,
+            "final":           score,
         }
 
     return min(1.0, max(0.0, score))
@@ -729,6 +780,7 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
                 attacked=image,
                 reference=None,
                 use_multi_hypothesis=True,
+                key=key,
             )
             if prof:
                 prof.stage_times["0_fourier_mellin"] = time.perf_counter() - stage_t0
@@ -742,7 +794,16 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             stage_t0 = time.perf_counter()
         try:
             _, Y_detect = _to_ycbcr(image)
-            sync_estimate = detect_sync_template(Y_detect, key)
+            if fm_result is not None:
+                sync_estimate = refine_geometry_from_template(
+                    Y_detect, key,
+                    initial_rotation=fm_result["rotation_deg"],
+                    initial_scale=fm_result["scale_factor"],
+                    refine_range_deg=2.0,
+                    refine_range_scale=0.05
+                )
+            else:
+                sync_estimate = detect_sync_template(Y_detect, key)
             if prof:
                 prof.stage_times["0b_sync_template"] = time.perf_counter() - stage_t0
 
@@ -770,7 +831,9 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
                         fm_result["confidence"] = min(
                             1.0, fm_result.get("confidence", 0.0) * 1.5
                         )
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             sync_estimate = None
             if prof:
                 prof.stage_times["0b_sync_template"] = time.perf_counter() - stage_t0
@@ -839,6 +902,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
                         "angle_deg": cand_angle, "scale_factor": cand_scale,
                         "score": float(crc_0c) / K_SHARDS,
                         "shard_count": crc_0c, "method": "fm_direct",
+                        "pilot_recovery_rate": (
+                            sync_estimate.pilot_recovery_rate
+                            if sync_estimate is not None else 0.0
+                        ),
                     }
                 if crc_0c > best_crc:
                     best_crc   = crc_0c
@@ -872,6 +939,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             "angle_deg": 0.0, "scale_factor": 1.0,
             "score": float(id_crc) / K_SHARDS,
             "shard_count": id_crc, "method": "identity",
+            "pilot_recovery_rate": (
+                sync_estimate.pilot_recovery_rate
+                if sync_estimate is not None else 0.0
+            ),
         }
 
 
@@ -924,7 +995,6 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
         # 2a. FFT Coarse Geometry Initialization
         from src.core.gpu_fft_geometry import estimate_geometry_fft
         try:
-            from src.core.wm_engine_p3 import _to_ycbcr
             _, Y_orig = _to_ycbcr(image)
             fft_candidates = estimate_geometry_fft(Y_orig)
             for (a, s) in fft_candidates:
@@ -966,7 +1036,6 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
     if gpu_results and len(gpu_results) > 0:
         canary_results = gpu_results
     else:
-        from src.core.wm_engine_p3 import _to_ycbcr
         _, Y_orig = _to_ycbcr(image)
         canary_results = []
         for angle, sf in candidates:
@@ -992,6 +1061,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             "angle_deg": best_angle, "scale_factor": best_scale,
             "score": float(best_crc) / K_SHARDS,
             "shard_count": best_crc, "method": "identity_no_signal",
+            "pilot_recovery_rate": (
+                sync_estimate.pilot_recovery_rate
+                if sync_estimate is not None else 0.0
+            ),
         }
 
     # ── Stage 4: Promote top candidates to full P4 scoring ────────────
@@ -1072,6 +1145,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             "angle_deg": best_angle, "scale_factor": best_scale,
             "score": float(best_crc) / K_SHARDS,
             "shard_count": best_crc, "method": method,
+            "pilot_recovery_rate": (
+                sync_estimate.pilot_recovery_rate
+                if sync_estimate is not None else 0.0
+            ),
         }
 
     # ── Stage 5: Extended search — only if canary had signal ──────────
@@ -1123,6 +1200,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             "angle_deg": best_angle, "scale_factor": best_scale,
             "score": float(best_crc) / K_SHARDS,
             "shard_count": best_crc, "method": "extended_canary",
+            "pilot_recovery_rate": (
+                sync_estimate.pilot_recovery_rate
+                if sync_estimate is not None else 0.0
+            ),
         }
 
     # ── Stage 6: Fine-tune around best (only if we found something) ───
@@ -1143,6 +1224,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             "angle_deg": 0.0, "scale_factor": 1.0,
             "score": float(id_crc) / K_SHARDS,
             "shard_count": id_crc, "method": "identity",
+            "pilot_recovery_rate": (
+                sync_estimate.pilot_recovery_rate
+                if sync_estimate is not None else 0.0
+            ),
         }
 
     # ── Brute-force geometry validation gate (Task 5) ─────────────────
@@ -1154,6 +1239,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
             "angle_deg": 0.0, "scale_factor": 1.0,
             "score": float(id_crc) / K_SHARDS,
             "shard_count": id_crc, "method": "identity_geo_rejected",
+            "pilot_recovery_rate": (
+                sync_estimate.pilot_recovery_rate
+                if sync_estimate is not None else 0.0
+            ),
         }
 
     method = "brute_force" if USE_LEGACY_GEOMETRY else "fourier_mellin_seeded"
@@ -1161,6 +1250,10 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
         "angle_deg": best_angle, "scale_factor": best_scale,
         "score": float(best_crc) / K_SHARDS,
         "shard_count": best_crc, "method": method,
+        "pilot_recovery_rate": (
+            sync_estimate.pilot_recovery_rate
+            if sync_estimate is not None else 0.0
+        ),
     }
 
 
@@ -1287,6 +1380,7 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
         "inner_codeword": None, "error": None,
         "geometry": None, "corrected_image_shape": None,
         "sync_template": None,
+        "shard_crc_ratio": 0.0,
     }
 
     if image.ndim != 3 or image.shape[2] != 3:
@@ -1313,7 +1407,17 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
                 "score": 1.0, "method": "direct",
             }
             p4_direct["corrected_image_shape"] = image.shape[:2]
-            p4_direct["sync_template"] = None
+            p4_direct["shard_crc_ratio"] = direct_crc_ratio
+            # Direct P4 path: quick sync template detection for pilot signal
+            # (fast — just pilot detection on identity image, ~50ms)
+            direct_pilot_rate = 0.0
+            try:
+                _, Y_direct = _to_ycbcr(image)
+                sync_direct = detect_sync_template(Y_direct, key)
+                if sync_direct is not None:
+                    direct_pilot_rate = sync_direct.pilot_recovery_rate
+            except Exception:
+                pass
             # signature_verified=False: detect_p5 has no public key.
             # verify_p5 (mist.py) sets confidence=1.0 after crypto verification.
             p4_direct["confidence"] = _compute_confidence(
@@ -1323,6 +1427,9 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
                 shard_crc_ratio=direct_crc_ratio,
                 geometry_confidence=1.0,
                 correlation=0.0,
+                shard_count=p4_direct.get("shard_crc_ok_count", 0),
+                shards_needed=p4_direct.get("shards_needed", K_SHARDS),
+                pilot_recovery_rate=direct_pilot_rate,
             )
             return p4_direct
         # CRC ratio too low — likely RS false-decode; fall through to geometry pipeline.
@@ -1372,12 +1479,27 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
 
     # Handle early-exit methods from stop conditions
     if geo["method"] in ("identity", "identity_no_signal", "identity_geo_rejected"):
-        result["confidence"] = p4_direct["confidence"]
         result["tiles_located"] = p4_direct["tiles_located"]
         result["shards_recovered"] = p4_direct["shards_recovered"]
         result["reconstruction_ratio"] = p4_direct["reconstruction_ratio"]
+        result["shard_crc_ratio"] = p4_direct.get("shard_crc_ratio", 0.0)
         result["error"] = p4_direct.get(
             "error", f"No geometric correction improved detection ({geo['method']})."
+        )
+        # Compute dual-head confidence even on identity path so HEAD B
+        # can distinguish watermarked-but-unverified from clean.
+        identity_pilot = geo.get("pilot_recovery_rate", 0.0)
+        identity_shard_count = p4_direct.get("shard_crc_ok_count", 0)
+        result["confidence"] = _compute_confidence(
+            signature_verified=False,
+            rs_decode_success=p4_direct.get("inner_codeword") is not None,
+            shard_consistency=p4_direct.get("reconstruction_ratio", 0.0),
+            shard_crc_ratio=p4_direct.get("shard_crc_ratio", 0.0),
+            geometry_confidence=0.0,
+            correlation=0.0,
+            shard_count=identity_shard_count,
+            shards_needed=p4_direct.get("shards_needed", K_SHARDS),
+            pilot_recovery_rate=identity_pilot,
         )
         return result
 
@@ -1426,21 +1548,42 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
         0, geo.get("shard_count", 0), geo.get("method", ""),
     )
     shard_ratio = result["reconstruction_ratio"]
-    rs_ok = result["inner_codeword"] is not None
-    # CRC ratio from P4 on corrected image — strongly discriminative:
-    # genuine WM with correct geometry: crc_ratio ≈ 1.0
-    # clean image with wrong FM geometry: crc_ratio ≈ 0.004
-    crc_ratio = p4_corrected.get("shard_crc_ratio", 0.0)
+    rs_ok       = result["inner_codeword"] is not None
+    crc_ratio   = p4_corrected.get("shard_crc_ratio", 0.0)
+
+    # Strategy 1: raw shard CRC count from P4 on corrected image.
+    # We use CRC ok count because raw 'shards_recovered' accumulates random noise matches.
+    n_shards_found  = p4_corrected.get("shard_crc_ok_count", 0)
+    n_shards_needed = result.get("shards_needed", K_SHARDS)
+
+    # Strategy 2: pilot recovery rate from geometry result or sync template.
+    # estimate_geometry() now propagates pilot_recovery_rate from its
+    # internal Stage 0b sync template detection.
+    pilot_rate = geo.get("pilot_recovery_rate", 0.0)
+
+    # If geometry didn't run sync template (e.g. legacy pipeline), try quick detection
+    if pilot_rate < 0.01 and not USE_LEGACY_GEOMETRY:
+        try:
+            _, Y_pilot = _to_ycbcr(image)
+            sync_fallback = detect_sync_template(Y_pilot, key)
+            if sync_fallback is not None:
+                pilot_rate = sync_fallback.pilot_recovery_rate
+        except Exception:
+            pass
+
+    # Store shard_crc_ratio in result for harness visibility
+    result["shard_crc_ratio"] = crc_ratio
 
     result["confidence"] = _compute_confidence(
-        # signature_verified=False: detect_p5 has no public key.
-        # verify_p5 (mist.py) sets confidence=1.0 after actual crypto verify.
-        signature_verified=False,
+        signature_verified=False,   # verify_p5 sets 1.0 after crypto verify
         rs_decode_success=rs_ok,
         shard_consistency=shard_ratio,
         shard_crc_ratio=crc_ratio,
         geometry_confidence=geo_stability,
         correlation=0.0,
+        shard_count=n_shards_found,
+        shards_needed=n_shards_needed,
+        pilot_recovery_rate=pilot_rate,
     )
 
     if result["inner_codeword"] is not None:

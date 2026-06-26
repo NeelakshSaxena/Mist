@@ -85,6 +85,30 @@ def _apply_hann_window(image: np.ndarray) -> np.ndarray:
     return image * window
 
 
+def _center_crop_or_pad(image: np.ndarray, target_size: int) -> np.ndarray:
+    """
+    Center crop or zero-pad the image to target_size x target_size.
+    Unlike resizing, cropping preserves absolute spatial frequencies (cycles per pixel),
+    which is essential for scale estimation via Fourier-Mellin against an ideal reference.
+    """
+    h, w = image.shape[:2]
+    out = np.zeros((target_size, target_size), dtype=image.dtype)
+    
+    cy_src, cx_src = h // 2, w // 2
+    cy_dst, cx_dst = target_size // 2, target_size // 2
+    
+    h_copy = min(h, target_size)
+    w_copy = min(w, target_size)
+    
+    src_y1 = cy_src - h_copy // 2
+    src_x1 = cx_src - w_copy // 2
+    dst_y1 = cy_dst - h_copy // 2
+    dst_x1 = cx_dst - w_copy // 2
+    
+    out[dst_y1:dst_y1+h_copy, dst_x1:dst_x1+w_copy] = image[src_y1:src_y1+h_copy, src_x1:src_x1+w_copy]
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  FFT Magnitude Spectrum
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,9 +274,11 @@ def _shifts_to_geometry(
         rotation_deg += 360.0
 
     # Scale: log-polar column shift → scale
+    # If the image was scaled UP, frequencies in the crop are LOWER,
+    # so shift_x is negative. Therefore, we use -shift_x to get scale > 1.0.
     max_radius = min(image_w, image_h) * _LP_RADIUS_FRAC / 2.0
     log_base = np.log(max_radius)
-    scale_factor = np.exp(shift_x * log_base / image_w)
+    scale_factor = np.exp(-shift_x * log_base / image_w)
 
     return rotation_deg, scale_factor
 
@@ -334,11 +360,10 @@ def fourier_mellin_register(
     if image_original_hw is None:
         image_original_hw = img.shape[:2]
 
-    # Resize to analysis size for deterministic performance
+    # Crop/pad to analysis size instead of resizing to preserve absolute spatial frequencies!
     h_orig, w_orig = img.shape
     if h_orig != _ANALYSIS_SIZE or w_orig != _ANALYSIS_SIZE:
-        img = cv2.resize(img, (_ANALYSIS_SIZE, _ANALYSIS_SIZE),
-                         interpolation=cv2.INTER_LINEAR)
+        img = _center_crop_or_pad(img, _ANALYSIS_SIZE)
 
     # ── Step 1: Hann window ───────────────────────────────────────────
     img_windowed = _apply_hann_window(img)
@@ -396,35 +421,6 @@ def fourier_mellin_register(
     # Clamp scale to supported range
     scale_factor = max(MIN_SCALE, min(MAX_SCALE, scale_factor))
 
-    # ── Resolve scale reciprocal ambiguity ────────────────────────────
-    # Phase correlation on log-polar spectra has a sign ambiguity for
-    # the scale axis. We resolve using actual image dimensions:
-    # if image is larger than reference, scale > 1; if smaller, < 1.
-    reciprocal_sf = 1.0 / scale_factor if scale_factor > 0.01 else 1.0
-    reciprocal_sf = max(MIN_SCALE, min(MAX_SCALE, reciprocal_sf))
-
-    if reference_original_hw is not None and image_original_hw is not None:
-        # Use dimension ratio to determine scale direction
-        img_area = image_original_hw[0] * image_original_hw[1]
-        ref_area = reference_original_hw[0] * reference_original_hw[1]
-        dim_ratio = (img_area / ref_area) ** 0.5 if ref_area > 0 else 1.0
-
-        if abs(dim_ratio - 1.0) > 0.03:
-            # Dimensions differ significantly — use dimension ratio as
-            # the scale estimate directly. This is more reliable than
-            # log-polar phase correlation for scale when dimensions
-            # are known. The FFT pipeline excels at rotation; scale is
-            # trivially computable from pixel dimensions.
-            scale_factor = max(MIN_SCALE, min(MAX_SCALE, dim_ratio))
-        else:
-            # Dimensions similar — pick closer to 1.0
-            if abs(reciprocal_sf - 1.0) < abs(scale_factor - 1.0):
-                scale_factor = reciprocal_sf
-    else:
-        # No dimension info — pick closer to 1.0
-        if abs(reciprocal_sf - 1.0) < abs(scale_factor - 1.0):
-            scale_factor = reciprocal_sf
-
     # ── Confidence calibration ────────────────────────────────────────
     # cv2.phaseCorrelate response is in [0, ~1] but often much lower.
     # Calibrate to a [0, 1] confidence score.
@@ -440,6 +436,7 @@ def fourier_mellin_register(
 def _multi_hypothesis_register(
     image: np.ndarray,
     reference: np.ndarray | None = None,
+    key: bytes | None = None,
     n_scales: int = 3,
 ) -> tuple[float, float, float, float]:
     """
@@ -478,27 +475,32 @@ def _multi_hypothesis_register(
             ref_gray_base = reference
 
     for sz in sizes[:n_scales]:
-        img_resized = cv2.resize(
-            gray_base.astype(np.float32), (sz, sz),
-            interpolation=cv2.INTER_LINEAR,
-        )
+        img_resized = _center_crop_or_pad(gray_base.astype(np.float32), sz)
 
         ref_resized = None
         if ref_gray_base is not None:
-            ref_resized = cv2.resize(
-                ref_gray_base.astype(np.float32), (sz, sz),
-                interpolation=cv2.INTER_LINEAR,
-            )
+            ref_resized = _center_crop_or_pad(ref_gray_base.astype(np.float32), sz)
 
         # Apply pipeline at this scale
         img_w = _apply_hann_window(img_resized)
         img_mag = _fft_magnitude(img_w)
         img_mag = _highpass_filter(img_mag)
 
-        if ref_resized is not None:
-            ref_w = _apply_hann_window(ref_resized)
+        if ref_gray_base is not None:
+            ref_w = _apply_hann_window(_center_crop_or_pad(ref_gray_base, sz))
             ref_mag = _fft_magnitude(ref_w)
             ref_mag = _highpass_filter(ref_mag)
+        elif key is not None:
+            from src.core.sync_template import _compute_pilot_positions, _derive_sync_key
+            ref_mag = np.zeros((sz, sz), dtype=np.float32)
+            sync_key = _derive_sync_key(key)
+            pilots = _compute_pilot_positions(sz, sz, sync_key)
+            for pr, pc, _ in pilots:
+                ref_mag[pr, pc] = 1.0
+                pr_conj, pc_conj = sz - pr, sz - pc
+                if 0 <= pr_conj < sz and 0 <= pc_conj < sz:
+                    ref_mag[pr_conj, pc_conj] = 1.0
+            # Pre-filter not needed since it's an ideal spectrum
         else:
             ref_mag = _generate_reference_spectrum(sz, sz)
 
@@ -517,21 +519,6 @@ def _multi_hypothesis_register(
 
         sf = max(MIN_SCALE, min(MAX_SCALE, sf))
 
-        # Dimension-aware scale resolution
-        reciprocal_sf = 1.0 / sf if sf > 0.01 else 1.0
-        reciprocal_sf = max(MIN_SCALE, min(MAX_SCALE, reciprocal_sf))
-
-        img_area = img_orig_hw[0] * img_orig_hw[1]
-        ref_area = ref_orig_hw[0] * ref_orig_hw[1]
-        dim_ratio = (img_area / ref_area) ** 0.5 if ref_area > 0 else 1.0
-
-        if abs(dim_ratio - 1.0) > 0.03:
-            # Use dimension ratio as scale when dimensions are known
-            sf = max(MIN_SCALE, min(MAX_SCALE, dim_ratio))
-        else:
-            if abs(reciprocal_sf - 1.0) < abs(sf - 1.0):
-                sf = reciprocal_sf
-
         conf = min(1.0, max(0.0, response))
 
         if conf > best[2]:
@@ -548,6 +535,7 @@ def estimate_geometry_sync(
     attacked: np.ndarray,
     reference: np.ndarray | None = None,
     use_multi_hypothesis: bool = True,
+    key: bytes | None = None,
 ) -> dict:
     """
     Estimate geometric transformation (rotation + scale) of an attacked image
@@ -576,10 +564,12 @@ def estimate_geometry_sync(
 
     if use_multi_hypothesis:
         rot, sf, conf, peak = _multi_hypothesis_register(
-            attacked, reference, n_scales=2,
+            attacked, reference, key=key, n_scales=2,
         )
         method = "fourier_mellin_multi"
     else:
+        # We don't update fourier_mellin_register since it's only for single-scale,
+        # but for safety pass reference as is.
         rot, sf, conf, peak = fourier_mellin_register(attacked, reference)
         method = "fourier_mellin"
 

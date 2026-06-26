@@ -263,13 +263,13 @@ Morgan Kaufmann, 2008. Chapter 7: "Informed Detection".
 **Idea**: Run multiple independent detectors; combine their outputs.
 Each detector uses a different feature space:
 
-| Detector | Feature | Geometry Sensitivity |
-|----------|---------|---------------------|
-| D1 | Shard count | Medium |
-| D2 | Pilot recovery rate | Low (FFT invariant) |
-| D3 | Harmonic score (P3) | Low |
-| D4 | DCT correlation | Medium |
-| D5 | Canary score | High |
+| Detector | Feature             | Geometry Sensitivity |
+| -------- | ------------------- | -------------------- |
+| D1       | Shard count         | Medium               |
+| D2       | Pilot recovery rate | Low (FFT invariant)  |
+| D3       | Harmonic score (P3) | Low                  |
+| D4       | DCT correlation     | Medium               |
+| D5       | Canary score        | High                 |
 
 ```python
 def ensemble_detection_score(
@@ -297,14 +297,14 @@ def ensemble_detection_score(
 
 ## Priority Ranking by ROC AUC Impact vs. Effort
 
-| # | Strategy | Est. AUC | Effort | Risk |
-|---|----------|----------|--------|------|
-| 1 | Dual-Head Scoring (shard count signal) | 0.70–0.80 | Low | Low |
-| 2 | Sync Template Pilot Rate as discriminant | 0.75–0.85 | Low | Low |
-| 3 | Matched Correlation Detector | 0.80–0.88 | Medium | Medium |
-| 4 | Neyman-Pearson Threshold Calibration | 0.85–0.92 | Medium | Low |
-| 5 | Multi-Hypothesis Ensemble Voting | 0.82–0.90 | Medium | Low |
-| 6 | Isotonic Regression Calibration | No AUC gain | Low | Low |
+| #   | Strategy                                 | Est. AUC    | Effort | Risk   |
+| --- | ---------------------------------------- | ----------- | ------ | ------ |
+| 1   | Dual-Head Scoring (shard count signal)   | 0.70–0.80   | Low    | Low    |
+| 2   | Sync Template Pilot Rate as discriminant | 0.75–0.85   | Low    | Low    |
+| 3   | Matched Correlation Detector             | 0.80–0.88   | Medium | Medium |
+| 4   | Neyman-Pearson Threshold Calibration     | 0.85–0.92   | Medium | Low    |
+| 5   | Multi-Hypothesis Ensemble Voting         | 0.82–0.90   | Medium | Low    |
+| 6   | Isotonic Regression Calibration          | No AUC gain | Low    | Low    |
 
 ---
 
@@ -374,3 +374,34 @@ clean images stay at conf ≈ 0.0–0.02.
 4. Hernandez et al., "Statistical Analysis of Watermarking Schemes" — Proc. IEEE 1999
 5. Pereira & Pun, "Fast Robust Template Matching for Affine Resistant Image Watermarking" — ResearchGate
 6. Cox et al., "Digital Watermarking and Steganography" — Morgan Kaufmann 2008
+
+--
+Viewed agenticPhase.md:37-57
+Created roc_auc_fix_strategies.md
+
+Created [`docs/phase5Fix/roc_auc_fix_strategies.md`](file:///g:/Projects/Mist/docs/phase5Fix/roc_auc_fix_strategies.md).
+
+Here's the core insight from the doc:
+
+## Why AUC = 0.5
+
+The harness data already tells you what's needed:
+
+```
+WM + scale 1.5×:   shards=61  →  conf=0.004
+Clean:              shards=18  →  conf=0.000
+```
+
+**61 vs 18 shards** — perfect discriminant, completely ignored because RS decode failed. The confidence formula only scores _verification_, not _detection_.
+
+## Priority Order
+
+| Strategy                                | AUC Est.  | Effort                                                            |
+| --------------------------------------- | --------- | ----------------------------------------------------------------- |
+| **Shard count as raw detection signal** | 0.70–0.80 | ⬛ Minimal — 10 lines in `_compute_confidence()`                  |
+| Sync template pilot recovery rate       | 0.75–0.85 | ⬛ Low — already available in `sync_estimate.pilot_recovery_rate` |
+| Matched correlation detector            | 0.80–0.88 | ⬜ Medium                                                         |
+| Neyman-Pearson threshold calibration    | 0.85–0.92 | ⬜ Medium                                                         |
+| Multi-hypothesis ensemble               | 0.82–0.90 | ⬜ Medium                                                         |
+
+The **quickest win** (Strategy 1 + 2 combined) requires ~20 lines of code and should take AUC from 0.5 → 0.75+ without touching the geometry pipeline at all. Want me to implement it?
