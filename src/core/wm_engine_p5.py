@@ -144,8 +144,9 @@ CONF_W_CORRELATION: float  = 0.05   # DCT correlation (weak prior)
 #
 # HEAD B — fires when RS decode fails (answered: "is a watermark present?")
 # Cap: 0.50  — so unverified detections never appear as confident as verified.
-CONF_W_SHARD_SIGNAL: float = 0.40   # Raw shard count above noise floor  [Strategy 1]
-CONF_W_PILOT_RATE: float   = 0.35   # Sync template pilot recovery rate  [Strategy 2]
+CONF_W_SHARD_SIGNAL: float = 0.25   # Raw shard count above noise floor  [Strategy 1]
+CONF_W_PILOT_RATE: float   = 0.25   # Sync template pilot recovery rate  [Strategy 2]
+CONF_W_P3_SIGNAL: float    = 0.25   # Phase 3 harmonic + presence score  [Strategy 3]
 CONF_W_CRC_EVIDENCE: float = 0.15   # CRC ratio (partial geometry evidence)
 CONF_W_GEO_DET: float      = 0.10   # Geometry confidence
 
@@ -555,6 +556,9 @@ def _compute_confidence(
     shards_needed: int = 30,
     # Strategy 2: pilot recovery rate from sync template
     pilot_recovery_rate: float = 0.0,
+    # Strategy 3: Phase 3 geometry-invariant signals
+    harmonic_score: float = 0.0,
+    presence_score: float = 0.0,
 ) -> float:
     """
     Compute calibrated confidence score from multiple signals.
@@ -569,10 +573,11 @@ def _compute_confidence(
 
       HEAD B (detection) — fires when RS decode fails:
         Answers "is a watermark present?" independently of RS/crypto.
-        1. Shard count signal    weight 0.40  (Strategy 1)
-        2. Pilot recovery rate   weight 0.35  (Strategy 2)
-        3. CRC evidence          weight 0.15
-        4. Geometry confidence   weight 0.10
+        1. Shard count signal    weight 0.25  (Strategy 1 — CRC-validated shards)
+        2. Pilot recovery rate   weight 0.25  (Strategy 2 — sync template)
+        3. P3 signal             weight 0.25  (Strategy 3 — FFT harmonic + DCT presence)
+        4. CRC evidence          weight 0.15
+        5. Geometry confidence   weight 0.10
 
         HEAD B is capped at 0.50 so unverified detections never
         appear as confident as verified ones.
@@ -613,17 +618,25 @@ def _compute_confidence(
     shard_signal = min(1.0, shard_signal)
 
     # Strategy 2 — Pilot recovery rate:
-    #   Clean images:    ~4-8% false pilot hits
+    #   Clean images:    ~10-18% false pilot hits (empirical from harness)
     #   WM under attack: 25-80% pilot recovery (pilots survive rotation)
     #   Normalise: subtract false-alarm floor, scale to [0,1]
-    PILOT_FALSE_ALARM_FLOOR = 0.08   # empirical: ~8% false peaks on clean
+    PILOT_FALSE_ALARM_FLOOR = 0.18   # empirical: clean images show ~15% false peaks
     pilot_signal = max(0.0, (pilot_recovery_rate - PILOT_FALSE_ALARM_FLOOR)
                        / max(1.0 - PILOT_FALSE_ALARM_FLOOR, 0.01))
     pilot_signal = min(1.0, pilot_signal)
 
+    # Strategy 3 — Phase 3 geometry-invariant signals:
+    #   harmonic_score: FFT sinusoidal pattern detection (0 for clean, >0 for WM)
+    #   presence_score: multi-scale DCT detection (0 for clean, >0 for WM)
+    #   Both survive rotation/scaling because they use frequency-domain features.
+    p3_signal = min(1.0, 0.5 * min(1.0, harmonic_score)
+                       + 0.5 * min(1.0, presence_score))
+
     score_b = min(0.50, (
-        0.40 * shard_signal
-        + 0.35 * pilot_signal
+        0.25 * shard_signal       # CRC-validated shard count
+        + 0.25 * pilot_signal     # sync template pilot recovery
+        + 0.25 * p3_signal        # P3 geometry-invariant signal (key discriminant)
         + 0.15 * min(1.0, shard_crc_ratio * 2.0)   # partial CRC evidence
         + 0.10 * min(1.0, max(0.0, geometry_confidence))
     ))
@@ -647,9 +660,10 @@ def _compute_confidence(
             "shard_crc_ratio":   shard_crc_ratio,
             "geometry":        geometry_confidence * rs_gate,
             "correlation":     norm_corr,
-            # Strategy 1+2 signals
+            # Strategy 1+2+3 signals
             "shard_signal":    shard_signal,
             "pilot_signal":    pilot_signal,
+            "p3_signal":       p3_signal,
             "score_head_a":    score_a,
             "score_head_b":    score_b,
             "final":           score,
@@ -1408,18 +1422,10 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
             }
             p4_direct["corrected_image_shape"] = image.shape[:2]
             p4_direct["shard_crc_ratio"] = direct_crc_ratio
-            # Direct P4 path: quick sync template detection for pilot signal
-            # (fast — just pilot detection on identity image, ~50ms)
-            direct_pilot_rate = 0.0
-            try:
-                _, Y_direct = _to_ycbcr(image)
-                sync_direct = detect_sync_template(Y_direct, key)
-                if sync_direct is not None:
-                    direct_pilot_rate = sync_direct.pilot_recovery_rate
-            except Exception:
-                pass
+            # Direct P4 path: RS decode succeeded with high CRC ratio.
+            # Skip sync template detection (saves ~2s) — verify_p5 will
+            # set confidence=1.0 after crypto verification anyway.
             # signature_verified=False: detect_p5 has no public key.
-            # verify_p5 (mist.py) sets confidence=1.0 after crypto verification.
             p4_direct["confidence"] = _compute_confidence(
                 signature_verified=False,
                 rs_decode_success=True,
@@ -1429,7 +1435,8 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
                 correlation=0.0,
                 shard_count=p4_direct.get("shard_crc_ok_count", 0),
                 shards_needed=p4_direct.get("shards_needed", K_SHARDS),
-                pilot_recovery_rate=direct_pilot_rate,
+                harmonic_score=p4_direct.get("harmonic_score", 0.0),
+                presence_score=p4_direct.get("presence_score", 0.0),
             )
             return p4_direct
         # CRC ratio too low — likely RS false-decode; fall through to geometry pipeline.
@@ -1500,6 +1507,8 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
             shard_count=identity_shard_count,
             shards_needed=p4_direct.get("shards_needed", K_SHARDS),
             pilot_recovery_rate=identity_pilot,
+            harmonic_score=p4_direct.get("harmonic_score", 0.0),
+            presence_score=p4_direct.get("presence_score", 0.0),
         )
         return result
 
@@ -1584,6 +1593,8 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
         shard_count=n_shards_found,
         shards_needed=n_shards_needed,
         pilot_recovery_rate=pilot_rate,
+        harmonic_score=result.get("harmonic_score", 0.0),
+        presence_score=result.get("presence_score", 0.0),
     )
 
     if result["inner_codeword"] is not None:

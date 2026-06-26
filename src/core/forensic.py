@@ -491,6 +491,7 @@ def forensic_report(
         shard_crc_ratio=1.0 if report.ecc_success else 0.0,
         geometry_confidence=geo_stability,
         correlation=report.correlation_strength,
+        harmonic_score=report.harmonic_score,
     )
     # Use the higher of legacy vs multi-signal for the final report
     report.confidence_pct = max(report.confidence_pct, multi_conf * 100.0)
