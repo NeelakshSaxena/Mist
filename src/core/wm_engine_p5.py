@@ -122,13 +122,13 @@ MAX_REASONABLE_ANGLE: float = 25.0    # Reject candidates beyond ±25°
 SCALE_BOUND_LOW: float = 0.40        # Reject scale below 0.40×
 SCALE_BOUND_HIGH: float = 2.5        # Reject scale above 2.5×
 MIN_CANARY_SIGNAL: int = 2           # Abort search if best canary < 2
-MAX_CANDIDATES_EVAL: int = 6         # Cap total P4 evaluations (FM-seeded: rarely need >3)
+MAX_CANDIDATES_EVAL: int = 3         # Cap total P4 evaluations in promote stage
 MAX_REFINEMENT_ITER: int = 2         # Cap fine-tune iterations
 MIN_CRC_IMPROVEMENT: int = 1         # Min CRC gain to continue refinement
 SHARD_CONSISTENCY_MIN: float = 0.65  # Min shard/tile consistency ratio
 
 # ── Deployment Assertions ────────────────────────────────────────────────────
-MAX_DETECTION_TIME: float = 20.0     # Max seconds for detect_p5()
+MAX_DETECTION_TIME: float = 12.0     # Max seconds for detect_p5()
 MAX_FORENSIC_TIME: float = 60.0      # Max seconds for forensic_report()
 GEOMETRY_STAGE_DISAGREE_MAX: float = 5.0  # Max angle disagreement (°)
 
@@ -743,7 +743,12 @@ def _score_candidate_profiled(image: np.ndarray, key: bytes) -> tuple[int, int]:
 #  Multi-stage geometric search
 # ─────────────────────────────────────────────────────────────────────────────
 
-def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
+def estimate_geometry(
+    image: np.ndarray,
+    key: bytes,
+    identity_p4_result: dict | None = None,
+    t0_global: float | None = None,
+) -> dict:
     """
     Estimate geometric transform — GPU-ACCELERATED pipeline with
     stop conditions, candidate clustering, and geometry validation.
@@ -771,6 +776,14 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
       - Cap P4 evaluations at MAX_CANDIDATES_EVAL
       - Reject geometry outside bounds
       - Abort refinement after MAX_REFINEMENT_ITER without improvement
+      - Abort if global runtime > MAX_DETECTION_TIME
+
+    Parameters
+    ----------
+    image             : BGR uint8 image
+    key               : embed key
+    identity_p4_result: Optional P4 result from detect_p5 Step 1 (skips Stage 1)
+    t0_global         : Optional global start time for runtime enforcement
 
     Returns dict with angle_deg, scale_factor, shard_count, method.
     """
@@ -937,8 +950,13 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
     # ── Stage 1: Identity check ───────────────────────────────────────
     if prof:
         stage_t0 = time.perf_counter()
-    id_crc, id_total = _score_candidate_profiled(image, key)
-    eval_count += 1
+    # Reuse P4 result from detect_p5 Step 1 if available (saves ~5s)
+    if identity_p4_result is not None:
+        id_crc = identity_p4_result.get("shard_crc_ok_count", 0)
+        id_total = identity_p4_result.get("tiles_located", 0)
+    else:
+        id_crc, id_total = _score_candidate_profiled(image, key)
+        eval_count += 1
     if prof:
         prof.stage_times["1_identity"] = time.perf_counter() - stage_t0
         prof.record_geometry(0.0, 1.0, id_crc, "identity")
@@ -1084,12 +1102,17 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
     # ── Stage 4: Promote top candidates to full P4 scoring ────────────
     if prof:
         stage_t0 = time.perf_counter()
-    TOP_N = 5
+    TOP_N = MAX_CANDIDATES_EVAL  # Match cap — no point having TOP_N > max evals
     seen = set()
     promoted = []
 
     for score, angle, sf in canary_results[:TOP_N * 3]:
         if len(promoted) >= TOP_N or eval_count >= MAX_CANDIDATES_EVAL:
+            break
+        # Runtime abort: don't start new P4 evaluations if over time budget
+        if t0_global is not None and (time.perf_counter() - t0_global) > MAX_DETECTION_TIME:
+            if prof:
+                prof.rejection_reasons["runtime_abort"] += 1
             break
 
         # Geometry validation gate
@@ -1168,11 +1191,15 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
     # ── Stage 5: Extended search — only if canary had signal ──────────
     if prof:
         stage_t0 = time.perf_counter()
-    if best_crc < K_SHARDS and top_canary_score >= 2 and len(canary_results) > TOP_N:
+    # Skip extended search if we're already over the time budget
+    over_budget = t0_global is not None and (time.perf_counter() - t0_global) > MAX_DETECTION_TIME
+    if best_crc < K_SHARDS and top_canary_score >= 2 and len(canary_results) > TOP_N and not over_budget:
         for score, angle, sf in canary_results[TOP_N:TOP_N + 8]:
             if eval_count >= MAX_CANDIDATES_EVAL:
                 if prof:
                     prof.rejection_reasons["runtime_abort"] += 1
+                break
+            if t0_global is not None and (time.perf_counter() - t0_global) > MAX_DETECTION_TIME:
                 break
             if score < 2:
                 break
@@ -1223,7 +1250,8 @@ def estimate_geometry(image: np.ndarray, key: bytes) -> dict:
     # ── Stage 6: Fine-tune around best (only if we found something) ───
     if prof:
         stage_t0 = time.perf_counter()
-    if best_crc > id_crc and best_crc > 0 and eval_count < MAX_CANDIDATES_EVAL:
+    over_budget_6 = t0_global is not None and (time.perf_counter() - t0_global) > MAX_DETECTION_TIME
+    if best_crc > id_crc and best_crc > 0 and eval_count < MAX_CANDIDATES_EVAL and not over_budget_6:
         fine_a, fine_s, fine_c = _fine_tune(
             image, key, best_angle, best_scale, best_crc,
             max_evals=MAX_CANDIDATES_EVAL - eval_count,
@@ -1447,42 +1475,40 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
     result["scale_scores"] = p4_direct["scale_scores"]
     result["harmonic_score"] = p4_direct["harmonic_score"]
 
+    # ── Identity baseline confidence (floor for geometry-corrected path) ──
+    # Compute HEAD B score from identity P4 signals BEFORE geometry search.
+    # This ensures runtime cuts to the geometry pipeline can never reduce
+    # confidence below what the identity signals already provide.
+    # Without this floor, truncated candidate searches can tank WM confidence
+    # below clean FP scores, destroying ROC AUC.
+    _identity_baseline_conf = _compute_confidence(
+        signature_verified=False,
+        rs_decode_success=p4_direct.get("inner_codeword") is not None,
+        shard_consistency=p4_direct.get("reconstruction_ratio", 0.0),
+        shard_crc_ratio=p4_direct.get("shard_crc_ratio", 0.0),
+        geometry_confidence=0.0,
+        correlation=0.0,
+        shard_count=p4_direct.get("shard_crc_ok_count", 0),
+        shards_needed=p4_direct.get("shards_needed", K_SHARDS),
+        pilot_recovery_rate=0.0,
+        harmonic_score=p4_direct.get("harmonic_score", 0.0),
+        presence_score=p4_direct.get("presence_score", 0.0),
+    )
+
     # ── Step 2: Presence gate ─────────────────────────────────────────
     if not p4_direct["detected"] and p4_direct["presence_score"] < 0.10:
         result["error"] = "No watermark presence detected."
         return result
 
     # ── Step 3: Geometric estimation ──────────────────────────────────
-    geo = estimate_geometry(image, key)
+    # Pass p4_direct result to skip redundant identity P4 check (saves ~5s)
+    geo = estimate_geometry(image, key, identity_p4_result=p4_direct, t0_global=t0)
     result["geometry"] = geo
 
-    # ── Step 3b: Sync template refinement ─────────────────────────────
-    # Use the sync template to refine the geometry estimate with sub-degree
-    # accuracy if the template was detected during Stage 0b.
-    if not USE_LEGACY_GEOMETRY and geo["method"] not in (
-        "identity", "identity_no_signal", "identity_geo_rejected"
-    ):
-        try:
-            _, Y_refine = _to_ycbcr(image)
-            sync_refined = refine_geometry_from_template(
-                Y_refine, key,
-                initial_rotation=geo["angle_deg"],
-                initial_scale=geo["scale_factor"],
-            )
-            result["sync_template"] = {
-                "pilots_detected": sync_refined.pilots_detected,
-                "pilots_expected": sync_refined.pilots_expected,
-                "recovery_rate": sync_refined.pilot_recovery_rate,
-                "confidence": sync_refined.confidence,
-                "valid": sync_refined.valid,
-            }
-            # Use refined estimate if template confidence is strong
-            if sync_refined.valid and sync_refined.confidence > 0.4:
-                geo["angle_deg"] = sync_refined.rotation_deg
-                geo["scale_factor"] = sync_refined.scale_factor
-                geo["method"] += "+sync_refined"
-        except Exception:
-            pass
+    # Note: Step 3b (sync template refinement) is no longer needed here.
+    # estimate_geometry Stage 0b already runs refine_geometry_from_template
+    # with the FM seed, providing sub-degree accuracy. Running it again
+    # here was redundant and added ~1-2s.
 
     # Handle early-exit methods from stop conditions
     if geo["method"] in ("identity", "identity_no_signal", "identity_geo_rejected"):
@@ -1571,7 +1597,9 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
     pilot_rate = geo.get("pilot_recovery_rate", 0.0)
 
     # If geometry didn't run sync template (e.g. legacy pipeline), try quick detection
-    if pilot_rate < 0.01 and not USE_LEGACY_GEOMETRY:
+    # Skip if over time budget — pilot_rate is a "nice to have" discriminant
+    elapsed_pilot = time.perf_counter() - t0
+    if pilot_rate < 0.01 and not USE_LEGACY_GEOMETRY and elapsed_pilot < MAX_DETECTION_TIME:
         try:
             _, Y_pilot = _to_ycbcr(image)
             sync_fallback = detect_sync_template(Y_pilot, key)
@@ -1596,6 +1624,10 @@ def detect_p5(image: np.ndarray, key: bytes) -> dict:
         harmonic_score=result.get("harmonic_score", 0.0),
         presence_score=result.get("presence_score", 0.0),
     )
+
+    # Apply identity baseline floor: geometry correction should never
+    # LOWER confidence below what the identity path already provides.
+    result["confidence"] = max(result["confidence"], _identity_baseline_conf)
 
     if result["inner_codeword"] is not None:
         return result
