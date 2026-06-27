@@ -457,10 +457,10 @@ def detect_sync_template(
         candidate_angles = [initial_rotation]
         candidate_scales = [initial_scale]
     else:
-        # Coarse search grid — FM sync already provides fine estimate;
-        # sync template only needs to verify/correct near it.
-        candidate_angles = np.arange(-15.0, 16.0, 10.0)  # 4 angles
-        candidate_scales = [0.7, 1.0, 1.3]               # 3 scales
+        # Coarse search grid covering full rotation/scale range.
+        # 5° angle steps ensure we never miss an attack by more than 2.5°.
+        candidate_angles = np.arange(-20.0, 21.0, 5.0)   # 9 angles
+        candidate_scales = [0.6, 0.8, 1.0, 1.2, 1.5]     # 5 scales
 
     for angle_deg in candidate_angles:
         for scale in candidate_scales:
@@ -582,16 +582,17 @@ def refine_geometry_from_template(
             return 0.0
         return n * np.mean([s for d, s in zip(det_mask, snr_vals) if d])
 
-    # Fine grid: 0.2° steps for angle, 1% steps for scale
+    # Fine grid: 0.5° steps for angle, 2% steps for scale
+    # (0.5° precision is sufficient — P4 grid alignment handles residual)
     angles = np.arange(
         initial_rotation - refine_range_deg,
-        initial_rotation + refine_range_deg + 0.1,
-        0.2,
+        initial_rotation + refine_range_deg + 0.25,
+        0.5,
     )
     scales = np.arange(
         max(0.5, initial_scale - refine_range_scale),
-        min(1.6, initial_scale + refine_range_scale + 0.005),
-        0.01,
+        min(1.6, initial_scale + refine_range_scale + 0.01),
+        0.02,
     )
 
     for angle_deg in angles:

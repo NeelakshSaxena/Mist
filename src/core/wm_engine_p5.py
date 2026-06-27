@@ -82,6 +82,7 @@ from src.core.sync_template import (
     check_template_energy,
     SyncEstimate,
     DEFAULT_STRENGTH as SYNC_TEMPLATE_STRENGTH,
+    MIN_PILOTS_DETECTED as SYNC_MIN_PILOTS,
 )
 
 
@@ -122,7 +123,7 @@ MAX_REASONABLE_ANGLE: float = 25.0    # Reject candidates beyond ±25°
 SCALE_BOUND_LOW: float = 0.40        # Reject scale below 0.40×
 SCALE_BOUND_HIGH: float = 2.5        # Reject scale above 2.5×
 MIN_CANARY_SIGNAL: int = 2           # Abort search if best canary < 2
-MAX_CANDIDATES_EVAL: int = 3         # Cap total P4 evaluations in promote stage
+MAX_CANDIDATES_EVAL: int = 5         # Cap total P4 evaluations in promote stage
 MAX_REFINEMENT_ITER: int = 2         # Cap fine-tune iterations
 MIN_CRC_IMPROVEMENT: int = 1         # Min CRC gain to continue refinement
 SHARD_CONSISTENCY_MIN: float = 0.65  # Min shard/tile consistency ratio
@@ -611,8 +612,8 @@ def _compute_confidence(
     # Strategy 1 — Shard CRC count discriminant:
     #   Clean images:    ~0-1 random CRC matches (noise floor)
     #   WM under attack: 10-64 CRC matches (even when RS fails)
-    #   Noise floor = 2. Signal saturates at shards_needed (30).
-    noise_floor = 2.0
+    #   Noise floor = 3. Signal saturates at shards_needed (30).
+    noise_floor = 3.0
     signal_range = shards_needed * 1.0
     shard_signal = max(0.0, (shard_count - noise_floor) / max(signal_range, 1.0))
     shard_signal = min(1.0, shard_signal)
@@ -621,7 +622,7 @@ def _compute_confidence(
     #   Clean images:    ~10-18% false pilot hits (empirical from harness)
     #   WM under attack: 25-80% pilot recovery (pilots survive rotation)
     #   Normalise: subtract false-alarm floor, scale to [0,1]
-    PILOT_FALSE_ALARM_FLOOR = 0.18   # empirical: clean images show ~15% false peaks
+    PILOT_FALSE_ALARM_FLOOR = 0.22   # empirical: clean images show ~15-20% false peaks
     pilot_signal = max(0.0, (pilot_recovery_rate - PILOT_FALSE_ALARM_FLOOR)
                        / max(1.0 - PILOT_FALSE_ALARM_FLOOR, 0.01))
     pilot_signal = min(1.0, pilot_signal)
@@ -633,7 +634,7 @@ def _compute_confidence(
     p3_signal = min(1.0, 0.5 * min(1.0, harmonic_score)
                        + 0.5 * min(1.0, presence_score))
 
-    score_b = min(0.50, (
+    score_b = min(0.45, (
         0.25 * shard_signal       # CRC-validated shard count
         + 0.25 * pilot_signal     # sync template pilot recovery
         + 0.25 * p3_signal        # P3 geometry-invariant signal (key discriminant)
@@ -817,47 +818,44 @@ def estimate_geometry(
                 prof.stage_times["0_fourier_mellin"] = time.perf_counter() - stage_t0
 
         # ── Stage 0b: Sync Template Detection ─────────────────────────
+        # ALWAYS run coarse sync template detection first to cover the
+        # full [-20°,+20°] range.  FM self-reference is unreliable for
+        # rotation estimation because it has no ground-truth reference.
+        # The sync template has embedded pilots that provide ground truth.
         if prof:
             stage_t0 = time.perf_counter()
         try:
             _, Y_detect = _to_ycbcr(image)
-            if fm_result is not None:
-                sync_estimate = refine_geometry_from_template(
+            # Step 1: Coarse sync template search (9 angles × 5 scales)
+            sync_estimate = detect_sync_template(Y_detect, key)
+
+            # Step 2: Refine around the coarse winner (±2.5° × ±5% scale)
+            if sync_estimate.pilots_detected >= SYNC_MIN_PILOTS // 2:
+                sync_refined = refine_geometry_from_template(
                     Y_detect, key,
-                    initial_rotation=fm_result["rotation_deg"],
-                    initial_scale=fm_result["scale_factor"],
-                    refine_range_deg=2.0,
+                    initial_rotation=sync_estimate.rotation_deg,
+                    initial_scale=sync_estimate.scale_factor,
+                    refine_range_deg=2.5,
                     refine_range_scale=0.05
                 )
-            else:
-                sync_estimate = detect_sync_template(Y_detect, key)
+                if sync_refined.pilots_detected >= sync_estimate.pilots_detected:
+                    sync_estimate = sync_refined
+
             if prof:
                 prof.stage_times["0b_sync_template"] = time.perf_counter() - stage_t0
 
-            # Use sync template estimate whenever it found ANY pilots.
-            # Even a low-confidence sync estimate is more reliable than
-            # FM self-reference (which has no ground-truth reference image).
+            # Sync template has embedded pilots → ground truth.
+            # Always prefer sync estimate over FM self-reference.
             if sync_estimate.pilots_detected >= 3:
                 sync_conf = sync_estimate.confidence
-                fm_conf_cur = fm_result.get("confidence", 0.0) if fm_result else 0.0
-
-                # Always take sync estimate if it's non-trivially detected
-                if sync_conf > 0.05 or sync_estimate.pilots_detected >= 4:
-                    fm_result = {
-                        "rotation_deg":  sync_estimate.rotation_deg,
-                        "scale_factor":  sync_estimate.scale_factor,
-                        "confidence":    max(sync_conf, 0.05),
-                        "response_peak": sync_conf,
-                        "method":        "sync_template",
-                        "sync_pilots":   sync_estimate.pilots_detected,
-                    }
-                # If FM and sync agree (< 3° apart), boost FM confidence
-                elif fm_result is not None:
-                    fm_angle = fm_result["rotation_deg"]
-                    if abs(fm_angle - sync_estimate.rotation_deg) < 3.0:
-                        fm_result["confidence"] = min(
-                            1.0, fm_result.get("confidence", 0.0) * 1.5
-                        )
+                fm_result = {
+                    "rotation_deg":  sync_estimate.rotation_deg,
+                    "scale_factor":  sync_estimate.scale_factor,
+                    "confidence":    max(sync_conf, 0.10),
+                    "response_peak": sync_conf,
+                    "method":        "sync_template",
+                    "sync_pilots":   sync_estimate.pilots_detected,
+                }
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -887,8 +885,8 @@ def estimate_geometry(
             candidates_0c: list[tuple[float, float]] = [(fm_angle_0c, fm_scale_0c)]
 
             if fm_conf_0c < 0.25:
-                # Low confidence — try narrow rotation neighborhood
-                for da in [-2.0, -1.0, 1.0, 2.0]:
+                # Low confidence — try wider rotation neighborhood
+                for da in [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]:
                     candidates_0c.append((fm_angle_0c + da, fm_scale_0c))
 
             # Reciprocal scale (Fourier-Mellin log-polar ambiguity)
